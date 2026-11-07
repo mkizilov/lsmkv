@@ -4,3 +4,4 @@
 .venv/
 _opam/
 .DS_Store
+/target/

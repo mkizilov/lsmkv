@@ -15,3 +15,13 @@
 - End each turn with a short summary of changes, checks actually run, remaining limitations, and commit hash. The orchestrator will provide the next prompt only after this turn ends.
 
 Extend this file with the project's language-specific architecture and verification commands while retaining these boundaries.
+
+## Rust architecture and checks
+
+- `src/lib.rs` exposes the database API; `src/main.rs` is the `lsmkv-cli` binary. The intended storage architecture and API assumptions are in `DESIGN.md`.
+- Library code must never use `unwrap`, `expect`, or `panic!` outside tests.
+- Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`, or run all three with `scripts/check.sh`. Use at most two build/test workers.
+
+## Definition of done
+
+For every future task, `scripts/check.sh` must pass, new code must have tests, and `DESIGN.md` must be updated if the design changed. Give a short summary of the changes, then make a local Git commit with a conventional-commit message; do not push.
