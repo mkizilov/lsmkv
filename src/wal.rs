@@ -1,20 +1,27 @@
 //! Framed, checksummed write-ahead log batches.
 
+use crate::fs::{FileOptions, Fs, FsFile, NativeFs};
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use crate::fs::{FileOptions, Fs, FsFile, NativeFs};
 
 pub(crate) const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const BATCH_TYPE: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
-    Put { sequence: u64, key: Vec<u8>, value: Vec<u8> },
-    Delete { sequence: u64, key: Vec<u8> },
+    Put {
+        sequence: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        sequence: u64,
+        key: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,12 +49,20 @@ impl WalWriter {
         Self::open_with_fs(path, policy, Arc::new(NativeFs))
     }
 
-    pub fn open_with_fs(path: impl AsRef<Path>, policy: SyncPolicy, fs: Arc<dyn Fs>) -> io::Result<Self> {
-        if matches!(policy, SyncPolicy::Interval(interval) if interval.is_zero() || Instant::now().checked_add(interval).is_none()) {
+    pub fn open_with_fs(
+        path: impl AsRef<Path>,
+        policy: SyncPolicy,
+        fs: Arc<dyn Fs>,
+    ) -> io::Result<Self> {
+        if matches!(policy, SyncPolicy::Interval(interval) if interval.is_zero() || Instant::now().checked_add(interval).is_none())
+        {
             return Err(invalid_input("invalid sync interval"));
         }
         let path = path.as_ref();
-        let mut file = fs.open(path, FileOptions::new().read(true).append(true).create(true))?;
+        let mut file = fs.open(
+            path,
+            FileOptions::new().read(true).append(true).create(true),
+        )?;
         let length = file.len()?;
         let mut reader = WalReader::new(&mut file);
         while reader.next_batch()?.is_some() {}
@@ -58,7 +73,10 @@ impl WalWriter {
         let worker = thread::Builder::new()
             .name("lsmkv-wal-sync".into())
             .spawn(move || run_writer(file, policy, receiver))?;
-        Ok(Self { sender, worker: Some(worker) })
+        Ok(Self {
+            sender,
+            worker: Some(worker),
+        })
     }
 
     pub fn append(&self, batch: &[Operation]) -> io::Result<()> {
@@ -79,13 +97,17 @@ impl WalWriter {
         F: FnOnce(Sender<io::Result<()>>) -> io::Result<Command>,
     {
         let (sender, receiver) = mpsc::channel();
-        self.sender.send(command(sender)?).map_err(|_| broken_worker())?;
+        self.sender
+            .send(command(sender)?)
+            .map_err(|_| broken_worker())?;
         receiver.recv().map_err(|_| broken_worker())
     }
 
     fn finish(&mut self) -> io::Result<()> {
         if let Some(worker) = self.worker.take() {
-            let result = self.request(|reply| Ok(Command::Close(reply))).and_then(|r| r);
+            let result = self
+                .request(|reply| Ok(Command::Close(reply)))
+                .and_then(|r| r);
             worker.join().map_err(|_| broken_worker())?;
             result
         } else {
@@ -167,8 +189,13 @@ fn run_writer(mut file: Box<dyn FsFile>, policy: SyncPolicy, receiver: Receiver<
                 let result = if let Some((kind, message)) = &failure {
                     Err(io::Error::new(*kind, message.clone()))
                 } else if dirty {
-                    file.sync_all().map(|()| { dirty = false; deadline = None; })
-                } else { Ok(()) };
+                    file.sync_all().map(|()| {
+                        dirty = false;
+                        deadline = None;
+                    })
+                } else {
+                    Ok(())
+                };
                 (result, reply, false)
             }
             Command::Close(reply) => {
@@ -176,7 +203,9 @@ fn run_writer(mut file: Box<dyn FsFile>, policy: SyncPolicy, receiver: Receiver<
                     Err(io::Error::new(*kind, message.clone()))
                 } else if dirty {
                     file.sync_all().map(|()| dirty = false)
-                } else { Ok(()) };
+                } else {
+                    Ok(())
+                };
                 (result, reply, true)
             }
         };
@@ -184,10 +213,14 @@ fn run_writer(mut file: Box<dyn FsFile>, policy: SyncPolicy, receiver: Receiver<
             failure = Some((error.kind(), error.to_string()));
         }
         let _ = reply.send(result);
-        if close { break; }
+        if close {
+            break;
+        }
     }
     if dirty {
-        if let Err(error) = file.sync_all() { eprintln!("failed to sync disconnected WAL: {error}"); }
+        if let Err(error) = file.sync_all() {
+            eprintln!("failed to sync disconnected WAL: {error}");
+        }
     }
 }
 
@@ -200,13 +233,21 @@ fn encode(batch: &[Operation]) -> io::Result<Vec<u8>> {
     payload.extend_from_slice(&count.to_le_bytes());
     for operation in batch {
         let (kind, sequence, key, value): (u8, u64, &[u8], &[u8]) = match operation {
-            Operation::Put { sequence, key, value } => (1, *sequence, key, value),
+            Operation::Put {
+                sequence,
+                key,
+                value,
+            } => (1, *sequence, key, value),
             Operation::Delete { sequence, key } => (2, *sequence, key, &[]),
         };
         let key_len = u32::try_from(key.len()).map_err(|_| invalid_input("key too large"))?;
         let value_len = u32::try_from(value.len()).map_err(|_| invalid_input("value too large"))?;
-        let length = payload.len().checked_add(17).and_then(|n| n.checked_add(key.len()))
-            .and_then(|n| n.checked_add(value.len())).ok_or_else(|| invalid_input("batch too large"))?;
+        let length = payload
+            .len()
+            .checked_add(17)
+            .and_then(|n| n.checked_add(key.len()))
+            .and_then(|n| n.checked_add(value.len()))
+            .ok_or_else(|| invalid_input("batch too large"))?;
         if length > MAX_PAYLOAD {
             return Err(invalid_input("batch too large"));
         }
@@ -262,17 +303,27 @@ fn decode(mut payload: &[u8]) -> Option<Vec<Operation>> {
         let key = take(&mut payload, key_len)?.to_vec();
         let value = take(&mut payload, value_len)?.to_vec();
         operations.push(match kind {
-            1 => Operation::Put { sequence, key, value },
+            1 => Operation::Put {
+                sequence,
+                key,
+                value,
+            },
             2 if value.is_empty() => Operation::Delete { sequence, key },
             _ => return None,
         });
     }
-    if payload.is_empty() { Some(operations) } else { None }
+    if payload.is_empty() {
+        Some(operations)
+    } else {
+        None
+    }
 }
 
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_payload(bytes: &[u8]) -> Result<(), crate::Error> {
-    decode(bytes).map(|_| ()).ok_or(crate::Error::Corruption("invalid WAL payload"))
+    decode(bytes)
+        .map(|_| ())
+        .ok_or(crate::Error::Corruption("invalid WAL payload"))
 }
 
 /// Sequential reader that stops at the first invalid or incomplete record.
@@ -292,17 +343,26 @@ pub struct WalReader<R> {
 
 impl<R: Read> WalReader<R> {
     pub fn new(input: R) -> Self {
-        Self { input, valid_bytes: 0, stopped: false, reason: None }
+        Self {
+            input,
+            valid_bytes: 0,
+            stopped: false,
+            reason: None,
+        }
     }
 
     pub fn valid_bytes(&self) -> u64 {
         self.valid_bytes
     }
 
-    pub fn stop_reason(&self) -> Option<StopReason> { self.reason }
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.reason
+    }
 
     pub fn next_batch(&mut self) -> io::Result<Option<Vec<Operation>>> {
-        if self.stopped { return Ok(None); }
+        if self.stopped {
+            return Ok(None);
+        }
         self.stopped = true;
         let mut header = [0u8; 9];
         if let Some(reason) = read_header(&mut self.input, &mut header)? {
@@ -320,7 +380,11 @@ impl<R: Read> WalReader<R> {
             return Ok(None);
         };
         let checksum_actual = !crc32c_extend(crc32c_extend(!0u32, &header[4..]), &payload);
-        let batch = if checksum_actual == checksum { decode(&payload) } else { None };
+        let batch = if checksum_actual == checksum {
+            decode(&payload)
+        } else {
+            None
+        };
         if batch.is_none() {
             self.reason = Some(StopReason::Corrupt);
             return Ok(None);
@@ -343,7 +407,9 @@ fn read_payload(reader: &mut impl Read, length: usize) -> io::Result<Option<Vec<
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        payload.try_reserve(count).map_err(|_| io::Error::other("WAL payload allocation failed"))?;
+        payload
+            .try_reserve(count)
+            .map_err(|_| io::Error::other("WAL payload allocation failed"))?;
         payload.extend_from_slice(&buffer[..count]);
     }
     Ok(Some(payload))
@@ -353,9 +419,17 @@ fn read_header(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<Option<S
     let mut read = 0;
     while read < buffer.len() {
         match reader.read(&mut buffer[read..]) {
-            Ok(0) => return Ok(Some(if read == 0 { StopReason::Eof } else { StopReason::Torn })),
+            Ok(0) => {
+                return Ok(Some(if read == 0 {
+                    StopReason::Eof
+                } else {
+                    StopReason::Torn
+                }))
+            }
             Ok(count) => read += count,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Some(StopReason::Torn)),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(Some(StopReason::Torn))
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
@@ -365,7 +439,9 @@ fn read_header(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<Option<S
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, crc32c_extend, decode, Operation, StopReason, SyncPolicy, WalReader, WalWriter};
+    use super::{
+        crc32c, crc32c_extend, decode, Operation, StopReason, SyncPolicy, WalReader, WalWriter,
+    };
     use std::fs::{self, File};
     use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
@@ -380,24 +456,37 @@ mod tests {
         fn new() -> Self {
             let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
             fs::create_dir_all(&dir).unwrap();
-            Self(dir.join(format!("wal-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))))
+            Self(dir.join(format!(
+                "wal-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )))
         }
     }
 
     impl Drop for TestFile {
         fn drop(&mut self) {
-            if self.0.exists() { fs::remove_file(&self.0).unwrap(); }
+            if self.0.exists() {
+                fs::remove_file(&self.0).unwrap();
+            }
         }
     }
 
     fn batch(sequence: u64) -> Vec<Operation> {
-        vec![Operation::Put { sequence, key: sequence.to_le_bytes().to_vec(), value: vec![sequence as u8; (sequence % 31) as usize] }]
+        vec![Operation::Put {
+            sequence,
+            key: sequence.to_le_bytes().to_vec(),
+            value: vec![sequence as u8; (sequence % 31) as usize],
+        }]
     }
 
     #[test]
     fn crc_known_vector_and_empty_file() {
         assert_eq!(crc32c(b"123456789"), 0xe3069283);
-        assert_eq!(!crc32c_extend(crc32c_extend(!0, b"1234"), b"56789"), 0xe3069283);
+        assert_eq!(
+            !crc32c_extend(crc32c_extend(!0, b"1234"), b"56789"),
+            0xe3069283
+        );
         let mut reader = WalReader::new(Cursor::new(Vec::<u8>::new()));
         assert_eq!(reader.next_batch().unwrap(), None);
         assert_eq!(reader.stop_reason(), Some(StopReason::Eof));
@@ -410,7 +499,9 @@ mod tests {
         struct Limited(Cursor<Vec<u8>>);
         impl Read for Limited {
             fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-                if bytes.len() > 8192 { return Err(io::Error::other("unbounded read request")); }
+                if bytes.len() > 8192 {
+                    return Err(io::Error::other("unbounded read request"));
+                }
                 self.0.read(bytes)
             }
         }
@@ -432,17 +523,24 @@ mod tests {
     #[test]
     fn random_batches_round_trip() {
         let path = TestFile::new();
-        let writer = WalWriter::open(&path.0, SyncPolicy::Interval(Duration::from_millis(5))).unwrap();
+        let writer =
+            WalWriter::open(&path.0, SyncPolicy::Interval(Duration::from_millis(5))).unwrap();
         let mut seed = 0x1234_5678_9abc_def0u64;
         let mut expected = Vec::new();
         for _ in 0..3000 {
-            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
             let mut operations = Vec::new();
             for n in 0..(seed % 5 + 1) {
                 let sequence = seed.wrapping_add(n);
                 let key = sequence.to_le_bytes().to_vec();
                 if sequence & 1 == 0 {
-                    operations.push(Operation::Put { sequence, key, value: vec![sequence as u8; (sequence % 40) as usize] });
+                    operations.push(Operation::Put {
+                        sequence,
+                        key,
+                        value: vec![sequence as u8; (sequence % 40) as usize],
+                    });
                 } else {
                     operations.push(Operation::Delete { sequence, key });
                 }
@@ -455,7 +553,9 @@ mod tests {
         let file = File::open(&path.0).unwrap();
         let length = file.metadata().unwrap().len();
         let mut reader = WalReader::new(file);
-        for operations in expected { assert_eq!(reader.next_batch().unwrap(), Some(operations)); }
+        for operations in expected {
+            assert_eq!(reader.next_batch().unwrap(), Some(operations));
+        }
         assert_eq!(reader.next_batch().unwrap(), None);
         assert_eq!(reader.valid_bytes(), length);
     }

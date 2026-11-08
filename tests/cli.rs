@@ -12,13 +12,19 @@ impl TestDir {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
         fs::create_dir_all(&root).unwrap();
-        let path = root.join(format!("cli-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let path = root.join(format!(
+            "cli-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
 impl Drop for TestDir {
-    fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
 }
 
 fn cli(path: &Path, args: &[&str]) -> Output {
@@ -76,8 +82,12 @@ fn verify_detects_sstable_corruption() {
         db.put(b"key", b"value").unwrap();
         db.flush().unwrap();
     }
-    let table = fs::read_dir(&dir.0).unwrap().map(Result::unwrap)
-        .find(|entry| entry.file_name().to_string_lossy().ends_with(".sst")).unwrap().path();
+    let table = fs::read_dir(&dir.0)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".sst"))
+        .unwrap()
+        .path();
     let mut bytes = fs::read(&table).unwrap();
     bytes[0] ^= 1;
     fs::write(&table, bytes).unwrap();

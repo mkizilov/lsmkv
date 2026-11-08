@@ -13,7 +13,11 @@ impl TestDir {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
         fs::create_dir_all(&root).unwrap();
-        let path = root.join(format!("db-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let path = root.join(format!(
+            "db-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -41,7 +45,13 @@ fn writes_survive_reopen_and_sequence_continues() {
         let db = Db::open(&dir.0, Options::default()).unwrap();
         assert_eq!(db.get(b"a").unwrap(), Some(b"new".to_vec()));
         assert_eq!(db.get(b"b").unwrap(), None);
-        assert_eq!(db.scan(..).unwrap(), vec![(b"a".to_vec(), b"new".to_vec()), (b"c".to_vec(), b"three".to_vec())]);
+        assert_eq!(
+            db.scan(..).unwrap(),
+            vec![
+                (b"a".to_vec(), b"new".to_vec()),
+                (b"c".to_vec(), b"three".to_vec())
+            ]
+        );
         db.put(b"a", b"latest").unwrap();
         db.delete(b"c").unwrap();
     }
@@ -82,11 +92,16 @@ fn torn_batch_is_never_partially_replayed() {
 fn competing_open_is_rejected_and_lock_is_released() {
     let dir = TestDir::new();
     let db = Db::open(&dir.0, Options::default()).unwrap();
-    assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Locked)));
+    assert!(matches!(
+        Db::open(&dir.0, Options::default()),
+        Err(Error::Locked)
+    ));
     let status = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact").arg("lock_child")
+        .arg("--exact")
+        .arg("lock_child")
         .env("LSMKV_LOCK_TEST_PATH", &dir.0)
-        .status().unwrap();
+        .status()
+        .unwrap();
     assert!(status.success());
     drop(db);
     assert!(Db::open(&dir.0, Options::default()).is_ok());
@@ -95,7 +110,10 @@ fn competing_open_is_rejected_and_lock_is_released() {
 #[test]
 fn lock_child() {
     if let Some(path) = std::env::var_os("LSMKV_LOCK_TEST_PATH") {
-        assert!(matches!(Db::open(path, Options::default()), Err(Error::Locked)));
+        assert!(matches!(
+            Db::open(path, Options::default()),
+            Err(Error::Locked)
+        ));
     }
 }
 
@@ -105,10 +123,27 @@ fn rejects_nonmonotonic_wal_sequences() {
     let dir = TestDir::new();
     let path = dir.0.join("WAL");
     let writer = WalWriter::open(&path, SyncPolicy::EveryWrite).unwrap();
-    writer.append(&[Operation::Delete { sequence: 7, key: b"x".to_vec() }]).unwrap();
+    writer
+        .append(&[Operation::Delete {
+            sequence: 7,
+            key: b"x".to_vec(),
+        }])
+        .unwrap();
     writer.close().unwrap();
-    assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::InvalidSequence)));
-    assert!(OpenOptions::new().read(true).open(path).unwrap().metadata().unwrap().len() > 0);
+    assert!(matches!(
+        Db::open(&dir.0, Options::default()),
+        Err(Error::InvalidSequence)
+    ));
+    assert!(
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len()
+            > 0
+    );
 }
 
 #[test]
@@ -123,7 +158,10 @@ fn checksum_corruption_is_not_silently_truncated() {
     let mut bytes = fs::read(&path).unwrap();
     bytes[10] ^= 1;
     fs::write(&path, &bytes).unwrap();
-    assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Corruption("corrupt WAL record"))));
+    assert!(matches!(
+        Db::open(&dir.0, Options::default()),
+        Err(Error::Corruption("corrupt WAL record"))
+    ));
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
 
@@ -132,7 +170,10 @@ fn orphan_tables_without_manifest_do_not_create_an_empty_database() {
     let dir = TestDir::new();
     let orphan = dir.0.join("SST-00000000000000000001.sst");
     fs::write(&orphan, b"unknown table").unwrap();
-    assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Corruption("SSTables exist without a manifest"))));
+    assert!(matches!(
+        Db::open(&dir.0, Options::default()),
+        Err(Error::Corruption("SSTables exist without a manifest"))
+    ));
     assert_eq!(fs::read(orphan).unwrap(), b"unknown table");
     assert!(!dir.0.join("CURRENT").exists());
 }

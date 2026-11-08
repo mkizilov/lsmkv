@@ -30,15 +30,30 @@ fn positions(hash: u64, bit_count: u64, probes: u8) -> impl Iterator<Item = u64>
 }
 
 pub(super) fn build(hashes: &[u64], bits_per_key: usize) -> io::Result<Vec<u8>> {
-    if bits_per_key == 0 { return Ok(Vec::new()); }
-    let bits = hashes.len().checked_mul(bits_per_key).ok_or_else(|| io::Error::other("Bloom filter too large"))?.max(64);
-    let byte_count = bits.checked_add(7).ok_or_else(|| io::Error::other("Bloom filter too large"))? / 8;
-    let bit_count = u64::try_from(byte_count).ok().and_then(|n| n.checked_mul(8))
+    if bits_per_key == 0 {
+        return Ok(Vec::new());
+    }
+    let bits = hashes
+        .len()
+        .checked_mul(bits_per_key)
+        .ok_or_else(|| io::Error::other("Bloom filter too large"))?
+        .max(64);
+    let byte_count = bits
+        .checked_add(7)
+        .ok_or_else(|| io::Error::other("Bloom filter too large"))?
+        / 8;
+    let bit_count = u64::try_from(byte_count)
+        .ok()
+        .and_then(|n| n.checked_mul(8))
         .ok_or_else(|| io::Error::other("Bloom filter too large"))?;
     let probes = ((bits_per_key * 69 + 50) / 100).clamp(1, 30) as u8;
     let mut output = Vec::new();
-    let capacity = byte_count.checked_add(10).ok_or_else(|| io::Error::other("Bloom filter too large"))?;
-    output.try_reserve_exact(capacity).map_err(|_| io::Error::other("Bloom filter allocation failed"))?;
+    let capacity = byte_count
+        .checked_add(10)
+        .ok_or_else(|| io::Error::other("Bloom filter too large"))?;
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| io::Error::other("Bloom filter allocation failed"))?;
     output.push(VERSION);
     output.push(probes);
     put_u64(&mut output, bit_count);
@@ -60,22 +75,35 @@ pub(super) struct Bloom {
 
 impl Bloom {
     pub(super) fn parse(mut payload: &[u8]) -> Result<Option<Self>, Error> {
-        if payload.is_empty() { return Ok(None); }
-        let (&version, rest) = payload.split_first().ok_or(Error::Corruption("filter header"))?;
-        let (&probes, rest) = rest.split_first().ok_or(Error::Corruption("filter header"))?;
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        let (&version, rest) = payload
+            .split_first()
+            .ok_or(Error::Corruption("filter header"))?;
+        let (&probes, rest) = rest
+            .split_first()
+            .ok_or(Error::Corruption("filter header"))?;
         payload = rest;
         let bit_count = get_u64(&mut payload).ok_or(Error::Corruption("filter size"))?;
-        if version != VERSION || !(1..=30).contains(&probes) || bit_count < 64
-            || bit_count % 8 != 0 || u64::try_from(payload.len()).ok() != Some(bit_count / 8) {
+        if version != VERSION
+            || !(1..=30).contains(&probes)
+            || bit_count < 64
+            || bit_count % 8 != 0
+            || u64::try_from(payload.len()).ok() != Some(bit_count / 8)
+        {
             return Err(Error::Corruption("filter header"));
         }
-        Ok(Some(Self { probes, bits: payload.to_vec(), bit_count }))
+        Ok(Some(Self {
+            probes,
+            bits: payload.to_vec(),
+            bit_count,
+        }))
     }
 
     pub(super) fn may_contain(&self, key: &[u8]) -> bool {
-        positions(hash(key), self.bit_count, self.probes).all(|position| {
-            self.bits[(position / 8) as usize] & (1 << (position % 8)) != 0
-        })
+        positions(hash(key), self.bit_count, self.probes)
+            .all(|position| self.bits[(position / 8) as usize] & (1 << (position % 8)) != 0)
     }
 }
 
@@ -89,11 +117,18 @@ mod tests {
         let hashes: Vec<_> = (0..count).map(|n| hash(&(n * 2).to_be_bytes())).collect();
         let encoded = build(&hashes, 10).unwrap();
         let filter = Bloom::parse(&encoded).unwrap().unwrap();
-        for n in 0..count { assert!(filter.may_contain(&(n * 2).to_be_bytes())); }
-        let positives = (0..count).filter(|n| filter.may_contain(&(n * 2 + 1).to_be_bytes())).count();
+        for n in 0..count {
+            assert!(filter.may_contain(&(n * 2).to_be_bytes()));
+        }
+        let positives = (0..count)
+            .filter(|n| filter.may_contain(&(n * 2 + 1).to_be_bytes()))
+            .count();
         let measured = positives as f64 / count as f64;
         let theoretical = (1.0 - (-7.0f64 / 10.0).exp()).powi(7);
-        assert!(measured <= 1.5 * theoretical, "rate {measured}, theoretical {theoretical}");
+        assert!(
+            measured <= 1.5 * theoretical,
+            "rate {measured}, theoretical {theoretical}"
+        );
     }
 
     #[test]

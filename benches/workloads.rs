@@ -11,11 +11,16 @@ fn workloads(criterion: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(3));
     group.measurement_time(Duration::from_secs(10));
     for workload in Workload::ALL {
-        group.throughput(Throughput::Elements(if workload == Workload::Scan100 { 100 } else { 1 }));
+        group.throughput(Throughput::Elements(if workload == Workload::Scan100 {
+            100
+        } else {
+            1
+        }));
         let mut sequence = 0u64;
         group.bench_function(workload.name(), |bencher| {
             bencher.iter(|| {
-                step(dataset.db(), dataset.keys(), workload, black_box(sequence)).expect("benchmark operation failed");
+                step(dataset.db(), dataset.keys(), workload, black_box(sequence))
+                    .expect("benchmark operation failed");
                 sequence = sequence.wrapping_add(1);
             });
         });

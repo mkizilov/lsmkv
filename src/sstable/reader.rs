@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,8 +10,8 @@ use crate::memtable::{InternalKey, Kind};
 use crate::wal::crc32c;
 use crate::{Error, Options, Statistics};
 
-use super::FOOTER_MAGIC;
 use super::bloom::Bloom;
+use super::FOOTER_MAGIC;
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 type CacheKey = (u64, u64);
@@ -34,14 +34,23 @@ impl BlockCache {
     pub fn new(options: &Options) -> Self {
         Self {
             capacity: options.block_cache_capacity,
-            state: Mutex::new(CacheState { blocks: HashMap::new(), order: VecDeque::new(), bytes: 0 }),
+            state: Mutex::new(CacheState {
+                blocks: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+            }),
             statistics: Arc::clone(&options.statistics),
             fs: Arc::clone(&options.fs),
         }
     }
 
     fn contains(&self, key: CacheKey) -> Result<bool, Error> {
-        Ok(self.state.lock().map_err(|_| Error::Poisoned)?.blocks.contains_key(&key))
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .blocks
+            .contains_key(&key))
     }
 
     fn get(&self, key: CacheKey) -> Result<Option<Arc<Block>>, Error> {
@@ -59,7 +68,9 @@ impl BlockCache {
 
     fn insert(&self, key: CacheKey, block: Arc<Block>) -> Result<(), Error> {
         let size = block.memory_usage();
-        if size > self.capacity || self.capacity == 0 { return Ok(()); }
+        if size > self.capacity || self.capacity == 0 {
+            return Ok(());
+        }
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         if state.blocks.contains_key(&key) {
             state.order.retain(|item| *item != key);
@@ -67,7 +78,9 @@ impl BlockCache {
             return Ok(());
         }
         while state.bytes > self.capacity - size {
-            let Some(oldest) = state.order.pop_front() else { break };
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
             if let Some(removed) = state.blocks.remove(&oldest) {
                 state.bytes -= removed.memory_usage();
             }
@@ -94,16 +107,27 @@ struct Block {
 impl Block {
     fn memory_usage(&self) -> usize {
         self.data.capacity().saturating_add(
-            self.restarts.capacity().saturating_mul(std::mem::size_of::<usize>()),
+            self.restarts
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
         )
     }
 
-    fn entry(&self, offset: usize, previous: &[u8]) -> Result<(usize, Vec<u8>, InternalKey, Vec<u8>), Error> {
-        let mut input = self.data.get(offset..self.entries_end).ok_or(Error::Corruption("entry offset"))?;
+    fn entry(
+        &self,
+        offset: usize,
+        previous: &[u8],
+    ) -> Result<(usize, Vec<u8>, InternalKey, Vec<u8>), Error> {
+        let mut input = self
+            .data
+            .get(offset..self.entries_end)
+            .ok_or(Error::Corruption("entry offset"))?;
         let shared = length(&mut input)?;
         let suffix = length(&mut input)?;
         let value_len = length(&mut input)?;
-        if shared > previous.len() { return Err(Error::Corruption("shared key prefix")); }
+        if shared > previous.len() {
+            return Err(Error::Corruption("shared key prefix"));
+        }
         let suffix_bytes = take(&mut input, suffix)?;
         let value = take(&mut input, value_len)?.to_vec();
         let mut key_bytes = previous[..shared].to_vec();
@@ -122,7 +146,11 @@ impl Block {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let (_, _, key, _) = self.entry(self.restarts[mid], &[])?;
-            if key <= *target { lo = mid + 1; } else { hi = mid; }
+            if key <= *target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
         Ok(self.restarts[lo.saturating_sub(1)])
     }
@@ -142,20 +170,31 @@ pub struct SstableReader {
 impl SstableReader {
     /// Validate the complete file, then load its index. Share `cache` among tables.
     pub fn open(path: impl AsRef<Path>, cache: Arc<BlockCache>) -> Result<Self, Error> {
-        let mut file = cache.fs.open(path.as_ref(), FileOptions::new().read(true))?;
+        let mut file = cache
+            .fs
+            .open(path.as_ref(), FileOptions::new().read(true))?;
         let file_len = file.len()?;
-        if file_len < 48 { return Err(Error::Corruption("short footer")); }
+        if file_len < 48 {
+            return Err(Error::Corruption("short footer"));
+        }
         let footer_start = file_len - 40;
         file.seek(SeekFrom::Start(footer_start))?;
         let mut footer = [0; 40];
         read_exact(file.as_mut(), &mut footer)?;
-        let Footer { filter_offset, filter_size, index_offset, index_size } = decode_footer(&footer, file_len)?;
+        let Footer {
+            filter_offset,
+            filter_size,
+            index_offset,
+            index_size,
+        } = decode_footer(&footer, file_len)?;
         let filter_bytes = read_block(file.as_mut(), filter_offset, filter_size, footer_start)?;
         let filter = Bloom::parse(&filter_bytes)?;
         let index_bytes = read_block(file.as_mut(), index_offset, index_size, footer_start)?;
         let mut input = index_bytes.as_slice();
         let count = get_u32(&mut input).ok_or(Error::Corruption("index count"))? as usize;
-        if count > input.len() / 26 { return Err(Error::Corruption("index count")); }
+        if count > input.len() / 26 {
+            return Err(Error::Corruption("index count"));
+        }
         let mut index = Vec::new();
         let mut offset = 0u64;
         let mut previous: Option<InternalKey> = None;
@@ -165,12 +204,20 @@ impl SstableReader {
             let last = decode_key(take(&mut input, key_len)?)?;
             let block_offset = get_u64(&mut input).ok_or(Error::Corruption("index offset"))?;
             let size = get_u64(&mut input).ok_or(Error::Corruption("index size"))?;
-            if block_offset != offset || size < 12 { return Err(Error::Corruption("index layout")); }
-            offset = block_offset.checked_add(size).ok_or(Error::Corruption("index overflow"))?;
-            if offset > filter_offset { return Err(Error::Corruption("data block range")); }
+            if block_offset != offset || size < 12 {
+                return Err(Error::Corruption("index layout"));
+            }
+            offset = block_offset
+                .checked_add(size)
+                .ok_or(Error::Corruption("index overflow"))?;
+            if offset > filter_offset {
+                return Err(Error::Corruption("data block range"));
+            }
             let raw = read_block(file.as_mut(), block_offset, size, filter_offset)?;
             let (block, first, actual_last) = parse_block(raw)?;
-            if first_user_key.is_none() { first_user_key = Some(first.user_key.clone()); }
+            if first_user_key.is_none() {
+                first_user_key = Some(first.user_key.clone());
+            }
             if actual_last != last || previous.as_ref().is_some_and(|key| *key >= first) {
                 return Err(Error::Corruption("index key order"));
             }
@@ -187,23 +234,53 @@ impl SstableReader {
                 }
             }
             previous = Some(last.clone());
-            index.push(IndexEntry { last, offset: block_offset, size });
+            index.push(IndexEntry {
+                last,
+                offset: block_offset,
+                size,
+            });
         }
-        if !input.is_empty() || offset != filter_offset { return Err(Error::Corruption("index trailing data")); }
-        let id = NEXT_TABLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        if !input.is_empty() || offset != filter_offset {
+            return Err(Error::Corruption("index trailing data"));
+        }
+        let id = NEXT_TABLE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Corruption("table identifier exhausted"))?;
         let last_user_key = previous.map(|key| key.user_key);
-        Ok(Self { file: Mutex::new(file), index, cache, id, filter, first_user_key, last_user_key })
+        Ok(Self {
+            file: Mutex::new(file),
+            index,
+            cache,
+            id,
+            filter,
+            first_user_key,
+            last_user_key,
+        })
     }
 
     fn block(&self, number: usize) -> Result<Arc<Block>, Error> {
-        let entry = self.index.get(number).ok_or(Error::Corruption("block index"))?;
+        let entry = self
+            .index
+            .get(number)
+            .ok_or(Error::Corruption("block index"))?;
         let key = (self.id, entry.offset);
-        if let Some(block) = self.cache.get(key)? { return Ok(block); }
+        if let Some(block) = self.cache.get(key)? {
+            return Ok(block);
+        }
         let mut file = self.file.lock().map_err(|_| Error::Poisoned)?;
-        let raw = read_block(file.as_mut(), entry.offset, entry.size, entry.offset.checked_add(entry.size).ok_or(Error::Corruption("block range"))?)?;
+        let raw = read_block(
+            file.as_mut(),
+            entry.offset,
+            entry.size,
+            entry
+                .offset
+                .checked_add(entry.size)
+                .ok_or(Error::Corruption("block range"))?,
+        )?;
         let (block, _, last) = parse_block(raw)?;
-        if last != entry.last { return Err(Error::Corruption("index key mismatch")); }
+        if last != entry.last {
+            return Err(Error::Corruption("index key mismatch"));
+        }
         let block = Arc::new(block);
         self.cache.insert(key, Arc::clone(&block))?;
         Ok(block)
@@ -211,7 +288,9 @@ impl SstableReader {
 
     /// Find an exact internal key using the index and restart-point binary searches.
     pub fn get(&self, target: &InternalKey) -> Result<Option<Vec<u8>>, Error> {
-        if !self.may_read(target)? { return Ok(None); }
+        if !self.may_read(target)? {
+            return Ok(None);
+        }
         let mut iterator = self.iter();
         iterator.seek(target)?;
         match iterator.next() {
@@ -227,9 +306,15 @@ impl SstableReader {
     }
 
     /// Find the newest version visible at a sequence, including tombstones.
-    pub fn get_user_at(&self, user_key: &[u8], sequence: u64) -> Result<Option<(Kind, Vec<u8>)>, Error> {
+    pub fn get_user_at(
+        &self,
+        user_key: &[u8],
+        sequence: u64,
+    ) -> Result<Option<(Kind, Vec<u8>)>, Error> {
         let target = InternalKey::new(user_key.to_vec(), sequence, Kind::Put);
-        if !self.may_read(&target)? { return Ok(None); }
+        if !self.may_read(&target)? {
+            return Ok(None);
+        }
         let mut iterator = self.iter();
         iterator.seek(&target)?;
         match iterator.next() {
@@ -241,15 +326,27 @@ impl SstableReader {
 
     /// Inclusive user-key bounds; empty tables have no bounds.
     pub fn user_key_bounds(&self) -> Option<(&[u8], &[u8])> {
-        Some((self.first_user_key.as_deref()?, self.last_user_key.as_deref()?))
+        Some((
+            self.first_user_key.as_deref()?,
+            self.last_user_key.as_deref()?,
+        ))
     }
 
     fn may_read(&self, target: &InternalKey) -> Result<bool, Error> {
         let number = self.index.partition_point(|entry| entry.last < *target);
-        let Some(entry) = self.index.get(number) else { return Ok(false); };
-        if self.filter.as_ref().is_some_and(|filter| !filter.may_contain(&target.user_key)) {
+        let Some(entry) = self.index.get(number) else {
+            return Ok(false);
+        };
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.may_contain(&target.user_key))
+        {
             if !self.cache.contains((self.id, entry.offset))? {
-                self.cache.statistics.bloom_filter_block_reads_avoided.fetch_add(1, Ordering::Relaxed);
+                self.cache
+                    .statistics
+                    .bloom_filter_block_reads_avoided
+                    .fetch_add(1, Ordering::Relaxed);
             }
             return Ok(false);
         }
@@ -257,7 +354,14 @@ impl SstableReader {
     }
 
     pub fn iter(&self) -> SstableIterator<'_> {
-        SstableIterator { table: self, number: 0, block: None, offset: 0, previous: Vec::new(), failed: false }
+        SstableIterator {
+            table: self,
+            number: 0,
+            block: None,
+            offset: 0,
+            previous: Vec::new(),
+            failed: false,
+        }
     }
 }
 
@@ -269,18 +373,27 @@ struct Footer {
 }
 
 fn decode_footer(bytes: &[u8], file_len: u64) -> Result<Footer, Error> {
-    if bytes.len() != 40 || file_len < 48 { return Err(Error::Corruption("short footer")); }
+    if bytes.len() != 40 || file_len < 48 {
+        return Err(Error::Corruption("short footer"));
+    }
     let mut input = bytes;
     let filter_offset = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
     let filter_size = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
     let index_offset = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
     let index_size = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
-    if get_u64(&mut input) != Some(FOOTER_MAGIC) || filter_size < 4
+    if get_u64(&mut input) != Some(FOOTER_MAGIC)
+        || filter_size < 4
         || filter_offset.checked_add(filter_size) != Some(index_offset)
-        || index_offset.checked_add(index_size) != Some(file_len - 40) {
+        || index_offset.checked_add(index_size) != Some(file_len - 40)
+    {
         return Err(Error::Corruption("footer layout"));
     }
-    Ok(Footer { filter_offset, filter_size, index_offset, index_size })
+    Ok(Footer {
+        filter_offset,
+        filter_size,
+        index_offset,
+        index_size,
+    })
 }
 
 #[cfg(feature = "fuzzing")]
@@ -291,10 +404,14 @@ pub(crate) fn fuzz_footer(bytes: &[u8]) -> Result<(), Error> {
 }
 
 #[cfg(feature = "fuzzing")]
-pub(crate) fn fuzz_block(bytes: &[u8]) -> Result<(), Error> { parse_block(bytes.to_vec()).map(|_| ()) }
+pub(crate) fn fuzz_block(bytes: &[u8]) -> Result<(), Error> {
+    parse_block(bytes.to_vec()).map(|_| ())
+}
 
 #[cfg(feature = "fuzzing")]
-pub(crate) fn fuzz_filter(bytes: &[u8]) -> Result<(), Error> { Bloom::parse(bytes).map(|_| ()) }
+pub(crate) fn fuzz_filter(bytes: &[u8]) -> Result<(), Error> {
+    Bloom::parse(bytes).map(|_| ())
+}
 
 /// Forward iterator over internal keys in ascending internal-key order.
 pub struct SstableIterator<'a> {
@@ -310,17 +427,24 @@ impl SstableIterator<'_> {
     /// Position at the first internal key greater than or equal to `target`.
     pub fn seek(&mut self, target: &InternalKey) -> Result<(), Error> {
         self.failed = false;
-        self.number = self.table.index.partition_point(|entry| entry.last < *target);
+        self.number = self
+            .table
+            .index
+            .partition_point(|entry| entry.last < *target);
         self.block = None;
         self.offset = 0;
         self.previous.clear();
-        if self.number == self.table.index.len() { return Ok(()); }
+        if self.number == self.table.index.len() {
+            return Ok(());
+        }
         let block = self.table.block(self.number)?;
         let mut offset = block.restart_for(target)?;
         let mut previous = Vec::new();
         while offset < block.entries_end {
             let (next, bytes, key, _) = block.entry(offset, &previous)?;
-            if key >= *target { break; }
+            if key >= *target {
+                break;
+            }
             offset = next;
             previous = bytes;
         }
@@ -335,16 +459,25 @@ impl Iterator for SstableIterator<'_> {
     type Item = Result<(InternalKey, Vec<u8>), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed { return None; }
+        if self.failed {
+            return None;
+        }
         loop {
-            if self.number >= self.table.index.len() { return None; }
+            if self.number >= self.table.index.len() {
+                return None;
+            }
             if self.block.is_none() {
                 match self.table.block(self.number) {
                     Ok(block) => self.block = Some(block),
-                    Err(error) => { self.failed = true; return Some(Err(error)); }
+                    Err(error) => {
+                        self.failed = true;
+                        return Some(Err(error));
+                    }
                 }
             }
-            let Some(block) = &self.block else { return None };
+            let Some(block) = &self.block else {
+                return None;
+            };
             if self.offset == block.entries_end {
                 self.number += 1;
                 self.block = None;
@@ -358,14 +491,20 @@ impl Iterator for SstableIterator<'_> {
                     self.previous = bytes;
                     return Some(Ok((key, value)));
                 }
-                Err(error) => { self.failed = true; return Some(Err(error)); }
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
             }
         }
     }
 }
 
 fn decode_key(bytes: &[u8]) -> Result<InternalKey, Error> {
-    let split = bytes.len().checked_sub(9).ok_or(Error::Corruption("short internal key"))?;
+    let split = bytes
+        .len()
+        .checked_sub(9)
+        .ok_or(Error::Corruption("short internal key"))?;
     let mut tail = &bytes[split..];
     let sequence = get_u64(&mut tail).ok_or(Error::Corruption("internal sequence"))?;
     let kind = match tail {
@@ -382,15 +521,22 @@ fn length(input: &mut &[u8]) -> Result<usize, Error> {
 }
 
 fn take<'a>(input: &mut &'a [u8], size: usize) -> Result<&'a [u8], Error> {
-    let result = input.get(..size).ok_or(Error::Corruption("truncated entry"))?;
-    *input = input.get(size..).ok_or(Error::Corruption("truncated entry"))?;
+    let result = input
+        .get(..size)
+        .ok_or(Error::Corruption("truncated entry"))?;
+    *input = input
+        .get(size..)
+        .ok_or(Error::Corruption("truncated entry"))?;
     Ok(result)
 }
 
 fn read_exact(file: &mut dyn FsFile, bytes: &mut [u8]) -> Result<(), Error> {
     file.read_exact(bytes).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof { Error::Corruption("truncated file") }
-        else { Error::Io(error) }
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            Error::Corruption("truncated file")
+        } else {
+            Error::Io(error)
+        }
     })
 }
 
@@ -400,31 +546,49 @@ fn read_block(file: &mut dyn FsFile, offset: u64, size: u64, limit: u64) -> Resu
     }
     let size = usize::try_from(size).map_err(|_| Error::Corruption("block size"))?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(size).map_err(|_| Error::Io(io::Error::other("block allocation failed")))?;
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| Error::Io(io::Error::other("block allocation failed")))?;
     bytes.resize(size, 0);
     file.seek(SeekFrom::Start(offset))?;
     read_exact(file, &mut bytes)?;
     let payload_len = bytes.len() - 4;
     let mut checksum_bytes = &bytes[payload_len..];
     let checksum = get_u32(&mut checksum_bytes).ok_or(Error::Corruption("block checksum"))?;
-    if crc32c(&bytes[..payload_len]) != checksum { return Err(Error::Corruption("block checksum")); }
+    if crc32c(&bytes[..payload_len]) != checksum {
+        return Err(Error::Corruption("block checksum"));
+    }
     bytes.truncate(payload_len);
     Ok(bytes)
 }
 
 fn parse_block(data: Vec<u8>) -> Result<(Block, InternalKey, InternalKey), Error> {
-    let tail = data.len().checked_sub(4).ok_or(Error::Corruption("restart count"))?;
+    let tail = data
+        .len()
+        .checked_sub(4)
+        .ok_or(Error::Corruption("restart count"))?;
     let mut count_bytes = &data[tail..];
     let count = get_u32(&mut count_bytes).ok_or(Error::Corruption("restart count"))? as usize;
-    let bytes = count.checked_mul(4).ok_or(Error::Corruption("restart count"))?;
-    let entries_end = tail.checked_sub(bytes).ok_or(Error::Corruption("restart array"))?;
-    if count == 0 || entries_end == 0 { return Err(Error::Corruption("empty data block")); }
+    let bytes = count
+        .checked_mul(4)
+        .ok_or(Error::Corruption("restart count"))?;
+    let entries_end = tail
+        .checked_sub(bytes)
+        .ok_or(Error::Corruption("restart array"))?;
+    if count == 0 || entries_end == 0 {
+        return Err(Error::Corruption("empty data block"));
+    }
     let mut restart_bytes = &data[entries_end..tail];
     let mut restarts = Vec::new();
     for _ in 0..count {
-        restarts.push(get_u32(&mut restart_bytes).ok_or(Error::Corruption("restart array"))? as usize);
+        restarts
+            .push(get_u32(&mut restart_bytes).ok_or(Error::Corruption("restart array"))? as usize);
     }
-    let block = Block { data, entries_end, restarts };
+    let block = Block {
+        data,
+        entries_end,
+        restarts,
+    };
     let mut position = 0;
     let mut previous_bytes = Vec::new();
     let mut previous_key: Option<InternalKey> = None;
@@ -436,20 +600,30 @@ fn parse_block(data: Vec<u8>) -> Result<(Block, InternalKey, InternalKey), Error
                 return Err(Error::Corruption("restart position"));
             }
             let mut input = &block.data[position..entries_end];
-            if length(&mut input)? != 0 { return Err(Error::Corruption("restart prefix")); }
+            if length(&mut input)? != 0 {
+                return Err(Error::Corruption("restart prefix"));
+            }
         }
         let (next, bytes, key, _) = block.entry(position, &previous_bytes)?;
         if next <= position || previous_key.as_ref().is_some_and(|last| *last >= key) {
             return Err(Error::Corruption("data key order"));
         }
-        if first.is_none() { first = Some(key.clone()); }
+        if first.is_none() {
+            first = Some(key.clone());
+        }
         previous_key = Some(key);
         previous_bytes = bytes;
         position = next;
         entries += 1;
     }
-    if entries.div_ceil(16) != count { return Err(Error::Corruption("restart count")); }
-    Ok((block, first.ok_or(Error::Corruption("empty block"))?, previous_key.ok_or(Error::Corruption("empty block"))?))
+    if entries.div_ceil(16) != count {
+        return Err(Error::Corruption("restart count"));
+    }
+    Ok((
+        block,
+        first.ok_or(Error::Corruption("empty block"))?,
+        previous_key.ok_or(Error::Corruption("empty block"))?,
+    ))
 }
 
 #[cfg(test)]
@@ -461,8 +635,17 @@ mod tests {
 
     #[test]
     fn cache_evicts_lru_and_separates_table_ids() {
-        let cache = BlockCache::new(&Options { block_cache_capacity: 8, ..Options::default() });
-        let block = || Arc::new(Block { data: vec![0; 4], entries_end: 0, restarts: Vec::new() });
+        let cache = BlockCache::new(&Options {
+            block_cache_capacity: 8,
+            ..Options::default()
+        });
+        let block = || {
+            Arc::new(Block {
+                data: vec![0; 4],
+                entries_end: 0,
+                restarts: Vec::new(),
+            })
+        };
         cache.insert((1, 0), block()).unwrap();
         cache.insert((2, 0), block()).unwrap();
         assert!(cache.get((1, 0)).unwrap().is_some());
@@ -475,9 +658,16 @@ mod tests {
 
     #[test]
     fn disabled_and_oversized_blocks_are_not_cached() {
-        let block = Arc::new(Block { data: vec![0; 4], entries_end: 0, restarts: Vec::new() });
+        let block = Arc::new(Block {
+            data: vec![0; 4],
+            entries_end: 0,
+            restarts: Vec::new(),
+        });
         for capacity in [0, 3] {
-            let cache = BlockCache::new(&Options { block_cache_capacity: capacity, ..Options::default() });
+            let cache = BlockCache::new(&Options {
+                block_cache_capacity: capacity,
+                ..Options::default()
+            });
             cache.insert((1, 0), Arc::clone(&block)).unwrap();
             assert!(cache.get((1, 0)).unwrap().is_none());
         }
@@ -489,7 +679,9 @@ mod tests {
             assert!(decode_footer(&vec![0; length], 48).is_err());
         }
         let mut footer = Vec::new();
-        for value in [0, 4, 4, 8, FOOTER_MAGIC] { put_u64(&mut footer, value); }
+        for value in [0, 4, 4, 8, FOOTER_MAGIC] {
+            put_u64(&mut footer, value);
+        }
         assert!(decode_footer(&footer, 52).is_ok());
         for index in 0..footer.len() {
             let mut damaged = footer.clone();

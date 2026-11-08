@@ -6,11 +6,11 @@ use crate::encoding::{put_u32, put_u64, put_varint};
 use crate::memtable::{InternalKey, Kind};
 use crate::wal::crc32c;
 
-mod reader;
 mod bloom;
-pub use reader::{BlockCache, SstableIterator, SstableReader};
+mod reader;
 #[cfg(feature = "fuzzing")]
 pub(crate) use reader::{fuzz_block, fuzz_filter, fuzz_footer};
+pub use reader::{BlockCache, SstableIterator, SstableReader};
 
 const TARGET_BLOCK_SIZE: usize = 4096;
 const RESTART_INTERVAL: usize = 16;
@@ -67,7 +67,10 @@ impl<W: Write> SstableWriter<W> {
     /// Append one entry; duplicate or out-of-order internal keys are rejected.
     pub fn add(&mut self, key: &InternalKey, value: &[u8]) -> io::Result<()> {
         if self.failed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "table writer failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "table writer failed",
+            ));
         }
         if self.last_key.as_ref().is_some_and(|last| key <= last) {
             return Err(invalid("internal keys must be strictly increasing"));
@@ -75,15 +78,29 @@ impl<W: Write> SstableWriter<W> {
         if key.kind == Kind::Delete && !value.is_empty() {
             return Err(invalid("delete entries must have empty values"));
         }
-        let key_len = key.user_key.len().checked_add(9).ok_or_else(|| invalid("key too large"))?;
-        if key_len.checked_add(value.len()).and_then(|n| n.checked_add(34))
-            .and_then(|n| u32::try_from(n).ok()).is_none() {
+        let key_len = key
+            .user_key
+            .len()
+            .checked_add(9)
+            .ok_or_else(|| invalid("key too large"))?;
+        if key_len
+            .checked_add(value.len())
+            .and_then(|n| n.checked_add(34))
+            .and_then(|n| u32::try_from(n).ok())
+            .is_none()
+        {
             return Err(invalid("entry too large"));
         }
         let encoded = encode_key(key);
         let restart = self.block_entries % RESTART_INTERVAL == 0;
-        let shared = if restart { 0 } else {
-            self.previous_bytes.iter().zip(&encoded).take_while(|(a, b)| a == b).count()
+        let shared = if restart {
+            0
+        } else {
+            self.previous_bytes
+                .iter()
+                .zip(&encoded)
+                .take_while(|(a, b)| a == b)
+                .count()
         };
         let mut entry = Vec::new();
         put_varint(&mut entry, shared as u64);
@@ -91,7 +108,10 @@ impl<W: Write> SstableWriter<W> {
         put_varint(&mut entry, value.len() as u64);
         entry.extend_from_slice(&encoded[shared..]);
         entry.extend_from_slice(value);
-        let predicted = self.restarts.len().checked_add(restart as usize)
+        let predicted = self
+            .restarts
+            .len()
+            .checked_add(restart as usize)
             .and_then(|n| n.checked_mul(4))
             .and_then(|n| n.checked_add(8))
             .and_then(|n| n.checked_add(self.data.len()))
@@ -101,12 +121,18 @@ impl<W: Write> SstableWriter<W> {
             return self.add(key, value);
         }
         if restart {
-            self.restarts.push(u32::try_from(self.data.len()).map_err(|_| invalid("block too large"))?);
+            self.restarts
+                .push(u32::try_from(self.data.len()).map_err(|_| invalid("block too large"))?);
         }
         self.data.extend_from_slice(&entry);
         self.block_entries += 1;
         self.previous_bytes = encoded;
-        if self.bloom_bits_per_key != 0 && self.last_key.as_ref().is_none_or(|last| last.user_key != key.user_key) {
+        if self.bloom_bits_per_key != 0
+            && self
+                .last_key
+                .as_ref()
+                .is_none_or(|last| last.user_key != key.user_key)
+        {
             self.bloom_hashes.push(bloom::hash(&key.user_key));
         }
         self.last_key = Some(key.clone());
@@ -116,13 +142,19 @@ impl<W: Write> SstableWriter<W> {
     /// Finish the table and return the underlying writer; this does not fsync it.
     pub fn finish(mut self) -> io::Result<W> {
         if self.failed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "table writer failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "table writer failed",
+            ));
         }
         self.flush_data()?;
         let filter = bloom::build(&self.bloom_hashes, self.bloom_bits_per_key)?;
         let (filter_offset, filter_size) = self.write_block(&filter)?;
         let mut index = Vec::new();
-        put_u32(&mut index, u32::try_from(self.index.len()).map_err(|_| invalid("too many blocks"))?);
+        put_u32(
+            &mut index,
+            u32::try_from(self.index.len()).map_err(|_| invalid("too many blocks"))?,
+        );
         for entry in &self.index {
             put_varint(&mut index, entry.last_key.len() as u64);
             index.extend_from_slice(&entry.last_key);
@@ -149,9 +181,16 @@ impl<W: Write> SstableWriter<W> {
         for &restart in &self.restarts {
             put_u32(&mut block, restart);
         }
-        put_u32(&mut block, u32::try_from(self.restarts.len()).map_err(|_| invalid("too many restarts"))?);
+        put_u32(
+            &mut block,
+            u32::try_from(self.restarts.len()).map_err(|_| invalid("too many restarts"))?,
+        );
         let (offset, size) = self.write_block(&block)?;
-        self.index.push(BlockIndex { last_key: self.previous_bytes.clone(), offset, size });
+        self.index.push(BlockIndex {
+            last_key: self.previous_bytes.clone(),
+            offset,
+            size,
+        });
         self.restarts.clear();
         self.previous_bytes.clear();
         self.block_entries = 0;
@@ -159,11 +198,18 @@ impl<W: Write> SstableWriter<W> {
     }
 
     fn write_block(&mut self, block: &[u8]) -> io::Result<(u64, u64)> {
-        let size = u64::try_from(block.len()).map_err(|_| invalid("block too large"))?
-            .checked_add(4).ok_or_else(|| invalid("block too large"))?;
+        let size = u64::try_from(block.len())
+            .map_err(|_| invalid("block too large"))?
+            .checked_add(4)
+            .ok_or_else(|| invalid("block too large"))?;
         let offset = self.offset;
-        let next = offset.checked_add(size).ok_or_else(|| invalid("table too large"))?;
-        let result = self.output.write_all(block).and_then(|()| self.output.write_all(&crc32c(block).to_le_bytes()));
+        let next = offset
+            .checked_add(size)
+            .ok_or_else(|| invalid("table too large"))?;
+        let result = self
+            .output
+            .write_all(block)
+            .and_then(|()| self.output.write_all(&crc32c(block).to_le_bytes()));
         if let Err(error) = result {
             self.failed = true;
             return Err(error);
@@ -180,7 +226,10 @@ fn invalid(message: &str) -> io::Error {
 fn encode_key(key: &InternalKey) -> Vec<u8> {
     let mut encoded = key.user_key.clone();
     put_u64(&mut encoded, key.sequence.0);
-    encoded.push(match key.kind { Kind::Put => 1, Kind::Delete => 2 });
+    encoded.push(match key.kind {
+        Kind::Put => 1,
+        Kind::Delete => 2,
+    });
     encoded
 }
 
@@ -225,7 +274,9 @@ mod tests {
         assert_eq!(get_u64(&mut footer), Some(FOOTER_MAGIC));
         assert_eq!(index_offset + index_size, (bytes.len() - 40) as u64);
         assert_eq!(filter_offset + filter_size, index_offset);
-        assert!(Bloom::parse(block(&bytes, filter_offset, filter_size)).unwrap().is_some());
+        assert!(Bloom::parse(block(&bytes, filter_offset, filter_size))
+            .unwrap()
+            .is_some());
         let mut index = block(&bytes, index_offset, index_size);
         let count = get_u32(&mut index).unwrap();
         assert!(count > 1);
@@ -244,7 +295,9 @@ mod tests {
             let entries_end = data.len() - 4 - restart_count * 4;
             let mut restart_data = &data[entries_end..data.len() - 4];
             let mut restarts = Vec::new();
-            for _ in 0..restart_count { restarts.push(get_u32(&mut restart_data).unwrap() as usize); }
+            for _ in 0..restart_count {
+                restarts.push(get_u32(&mut restart_data).unwrap() as usize);
+            }
             let mut input = &data[..entries_end];
             let mut previous = Vec::new();
             let mut entry_number = 0;
@@ -281,8 +334,13 @@ mod tests {
         let filter_size = get_u64(&mut footer).unwrap();
         let index_offset = get_u64(&mut footer).unwrap();
         let index_size = get_u64(&mut footer).unwrap();
-        assert!(Bloom::parse(block(&bytes, filter_offset, filter_size)).unwrap().is_some());
-        assert_eq!(get_u32(&mut block(&bytes, index_offset, index_size)), Some(0));
+        assert!(Bloom::parse(block(&bytes, filter_offset, filter_size))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            get_u32(&mut block(&bytes, index_offset, index_size)),
+            Some(0)
+        );
         let mut writer = SstableWriter::new(Vec::new());
         let key = InternalKey::new(b"a".to_vec(), 2, Kind::Put);
         writer.add(&key, b"value").unwrap();
@@ -301,15 +359,26 @@ mod tests {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
             Err(io::Error::other("injected failure"))
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
     fn io_failure_prevents_reuse() {
         let mut writer = SstableWriter::new(FailingWriter);
-        writer.add(&InternalKey::new(b"a".to_vec(), 1, Kind::Put), &vec![0; 5000]).unwrap();
-        assert!(writer.add(&InternalKey::new(b"b".to_vec(), 2, Kind::Put), b"x").is_err());
-        assert!(writer.add(&InternalKey::new(b"c".to_vec(), 3, Kind::Put), b"x").is_err());
+        writer
+            .add(
+                &InternalKey::new(b"a".to_vec(), 1, Kind::Put),
+                &vec![0; 5000],
+            )
+            .unwrap();
+        assert!(writer
+            .add(&InternalKey::new(b"b".to_vec(), 2, Kind::Put), b"x")
+            .is_err());
+        assert!(writer
+            .add(&InternalKey::new(b"c".to_vec(), 3, Kind::Put), b"x")
+            .is_err());
         assert!(writer.finish().is_err());
     }
 }

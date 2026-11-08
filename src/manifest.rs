@@ -33,13 +33,23 @@ pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
     let current = dir.join("CURRENT");
     let current_exists = fs.exists(&current)?;
     if current_exists {
-        if fs.read(&current)? != CURRENT.as_bytes() { return Err(Error::Corruption("CURRENT")); }
+        if fs.read(&current)? != CURRENT.as_bytes() {
+            return Err(Error::Corruption("CURRENT"));
+        }
     } else {
         let manifest = dir.join(NAME);
         if !fs.exists(&manifest)? || fs.len(&manifest)? == 0 {
             let temporary = dir.join("MANIFEST-000001.tmp");
-            let mut file = fs.open(&temporary, FileOptions::new().write(true).create(true).truncate(true))?;
-            let initial = Edit { added: Vec::new(), removed: Vec::new(), next_file: 1, last_sequence: 0 };
+            let mut file = fs.open(
+                &temporary,
+                FileOptions::new().write(true).create(true).truncate(true),
+            )?;
+            let initial = Edit {
+                added: Vec::new(),
+                removed: Vec::new(),
+                next_file: 1,
+                last_sequence: 0,
+            };
             file.write_all(&encode(&initial)?)?;
             file.sync_all()?;
             fs.rename(&temporary, &manifest)?;
@@ -56,7 +66,10 @@ pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
     }
     if !current_exists {
         let temporary = dir.join("CURRENT.tmp");
-        let mut file = fs.open(&temporary, FileOptions::new().write(true).create(true).truncate(true))?;
+        let mut file = fs.open(
+            &temporary,
+            FileOptions::new().write(true).create(true).truncate(true),
+        )?;
         file.write_all(CURRENT.as_bytes())?;
         file.sync_all()?;
         fs.rename(&temporary, &current)?;
@@ -67,10 +80,14 @@ pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
 
 /// Check the current manifest without creating or truncating files.
 pub fn verify(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
-    if fs.read(&dir.join("CURRENT"))? != CURRENT.as_bytes() { return Err(Error::Corruption("CURRENT")); }
+    if fs.read(&dir.join("CURRENT"))? != CURRENT.as_bytes() {
+        return Err(Error::Corruption("CURRENT"));
+    }
     let bytes = fs.read(&dir.join(NAME))?;
     let (version, valid) = parse_records(&bytes)?;
-    if valid != bytes.len() { return Err(Error::Corruption("torn manifest record")); }
+    if valid != bytes.len() {
+        return Err(Error::Corruption("torn manifest record"));
+    }
     Ok(version)
 }
 
@@ -78,8 +95,12 @@ fn parse_records(bytes: &[u8]) -> Result<(Version, usize), Error> {
     let mut position = 0usize;
     let mut version = Version::default();
     while position < bytes.len() {
-        let Some(header_end) = position.checked_add(12) else { return Err(Error::Corruption("manifest length")); };
-        if header_end > bytes.len() { break; }
+        let Some(header_end) = position.checked_add(12) else {
+            return Err(Error::Corruption("manifest length"));
+        };
+        if header_end > bytes.len() {
+            break;
+        }
         let mut header = &bytes[position..header_end];
         let size = get_u32(&mut header).ok_or(Error::Corruption("manifest header"))? as usize;
         let header_checksum = get_u32(&mut header).ok_or(Error::Corruption("manifest header"))?;
@@ -87,44 +108,74 @@ fn parse_records(bytes: &[u8]) -> Result<(Version, usize), Error> {
             return Err(Error::Corruption("manifest header checksum"));
         }
         let checksum = get_u32(&mut header).ok_or(Error::Corruption("manifest header"))?;
-        let end = header_end.checked_add(size).ok_or(Error::Corruption("manifest length"))?;
-        if end > bytes.len() { break; }
+        let end = header_end
+            .checked_add(size)
+            .ok_or(Error::Corruption("manifest length"))?;
+        if end > bytes.len() {
+            break;
+        }
         let payload = &bytes[header_end..end];
-        if crc32c(payload) != checksum { return Err(Error::Corruption("manifest checksum")); }
+        if crc32c(payload) != checksum {
+            return Err(Error::Corruption("manifest checksum"));
+        }
         apply(&mut version, decode(payload)?)?;
         position = end;
     }
-    if version.next_file == 0 { return Err(Error::Corruption("empty manifest")); }
+    if version.next_file == 0 {
+        return Err(Error::Corruption("empty manifest"));
+    }
     Ok((version, position))
 }
 
 #[cfg(feature = "fuzzing")]
-pub(crate) fn fuzz_edit(bytes: &[u8]) -> Result<(), Error> { decode(bytes).map(|_| ()) }
+pub(crate) fn fuzz_edit(bytes: &[u8]) -> Result<(), Error> {
+    decode(bytes).map(|_| ())
+}
 
 #[cfg(feature = "fuzzing")]
-pub(crate) fn fuzz_log(bytes: &[u8]) -> Result<(), Error> { parse_records(bytes).map(|_| ()) }
+pub(crate) fn fuzz_log(bytes: &[u8]) -> Result<(), Error> {
+    parse_records(bytes).map(|_| ())
+}
 
 fn decode(mut bytes: &[u8]) -> Result<Edit, Error> {
     let version = get_u32(&mut bytes).ok_or(Error::Corruption("manifest edit"))?;
-    if version != 1 { return Err(Error::Corruption("manifest version")); }
+    if version != 1 {
+        return Err(Error::Corruption("manifest version"));
+    }
     let next_file = get_u64(&mut bytes).ok_or(Error::Corruption("manifest edit"))?;
     let last_sequence = get_u64(&mut bytes).ok_or(Error::Corruption("manifest edit"))?;
     let added_count = get_u32(&mut bytes).ok_or(Error::Corruption("manifest edit"))? as usize;
     let removed_count = get_u32(&mut bytes).ok_or(Error::Corruption("manifest edit"))? as usize;
-    let total = added_count.checked_add(removed_count).ok_or(Error::Corruption("manifest count"))?;
-    if total.checked_mul(12) != Some(bytes.len()) { return Err(Error::Corruption("manifest count")); }
+    let total = added_count
+        .checked_add(removed_count)
+        .ok_or(Error::Corruption("manifest count"))?;
+    if total.checked_mul(12) != Some(bytes.len()) {
+        return Err(Error::Corruption("manifest count"));
+    }
     let mut added = Vec::new();
     let mut removed = Vec::new();
     for i in 0..total {
         let level = get_u32(&mut bytes).ok_or(Error::Corruption("manifest file"))?;
         let number = get_u64(&mut bytes).ok_or(Error::Corruption("manifest file"))?;
-        if i < added_count { added.push((level, number)); } else { removed.push((level, number)); }
+        if i < added_count {
+            added.push((level, number));
+        } else {
+            removed.push((level, number));
+        }
     }
-    Ok(Edit { added, removed, next_file, last_sequence })
+    Ok(Edit {
+        added,
+        removed,
+        next_file,
+        last_sequence,
+    })
 }
 
 fn apply(version: &mut Version, edit: Edit) -> Result<(), Error> {
-    if edit.next_file < version.next_file || edit.last_sequence < version.last_sequence || edit.next_file == 0 {
+    if edit.next_file < version.next_file
+        || edit.last_sequence < version.last_sequence
+        || edit.next_file == 0
+    {
         return Err(Error::Corruption("manifest ordering"));
     }
     for file in edit.removed {
@@ -149,14 +200,22 @@ fn encode(edit: &Edit) -> io::Result<Vec<u8>> {
     put_u32(&mut payload, 1);
     put_u64(&mut payload, edit.next_file);
     put_u64(&mut payload, edit.last_sequence);
-    put_u32(&mut payload, u32::try_from(edit.added.len()).map_err(|_| io::Error::other("manifest edit too large"))?);
-    put_u32(&mut payload, u32::try_from(edit.removed.len()).map_err(|_| io::Error::other("manifest edit too large"))?);
+    put_u32(
+        &mut payload,
+        u32::try_from(edit.added.len()).map_err(|_| io::Error::other("manifest edit too large"))?,
+    );
+    put_u32(
+        &mut payload,
+        u32::try_from(edit.removed.len())
+            .map_err(|_| io::Error::other("manifest edit too large"))?,
+    );
     for &(level, number) in edit.added.iter().chain(&edit.removed) {
         put_u32(&mut payload, level);
         put_u64(&mut payload, number);
     }
     let mut record = Vec::new();
-    let size = u32::try_from(payload.len()).map_err(|_| io::Error::other("manifest edit too large"))?;
+    let size =
+        u32::try_from(payload.len()).map_err(|_| io::Error::other("manifest edit too large"))?;
     put_u32(&mut record, size);
     put_u32(&mut record, crc32c(&size.to_le_bytes()));
     put_u32(&mut record, crc32c(&payload));
@@ -187,13 +246,19 @@ mod tests {
         fn new() -> Self {
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
             fs::create_dir_all(&root).unwrap();
-            let path = root.join(format!("manifest-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let path = root.join(format!(
+                "manifest-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
     }
     impl Drop for TestDir {
-        fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
     }
 
     #[test]
@@ -201,11 +266,36 @@ mod tests {
         let dir = TestDir::new();
         let version = open(&dir.0, &NativeFs).unwrap();
         assert_eq!(version.next_file, 1);
-        append(&dir.0, &Edit { added: vec![(0, 2)], removed: Vec::new(), next_file: 3, last_sequence: 7 }, &NativeFs).unwrap();
-        append(&dir.0, &Edit { added: vec![(1, 3)], removed: vec![(0, 2)], next_file: 4, last_sequence: 7 }, &NativeFs).unwrap();
+        append(
+            &dir.0,
+            &Edit {
+                added: vec![(0, 2)],
+                removed: Vec::new(),
+                next_file: 3,
+                last_sequence: 7,
+            },
+            &NativeFs,
+        )
+        .unwrap();
+        append(
+            &dir.0,
+            &Edit {
+                added: vec![(1, 3)],
+                removed: vec![(0, 2)],
+                next_file: 4,
+                last_sequence: 7,
+            },
+            &NativeFs,
+        )
+        .unwrap();
         let path = dir.0.join(NAME);
         let valid = fs::metadata(&path).unwrap().len();
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(&[1, 2, 3]).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1, 2, 3])
+            .unwrap();
         let version = open(&dir.0, &NativeFs).unwrap();
         assert_eq!(version.files, vec![(1, 3)]);
         assert_eq!(version.next_file, 4);
@@ -237,7 +327,10 @@ mod tests {
         assert!(!dir.0.join("CURRENT.tmp").exists());
         fs::remove_file(dir.0.join("CURRENT")).unwrap();
         assert_eq!(open(&dir.0, &NativeFs).unwrap().next_file, 1);
-        assert_eq!(fs::read(dir.0.join("CURRENT")).unwrap(), b"MANIFEST-000001\n");
+        assert_eq!(
+            fs::read(dir.0.join("CURRENT")).unwrap(),
+            b"MANIFEST-000001\n"
+        );
     }
 
     #[test]

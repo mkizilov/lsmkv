@@ -1,7 +1,8 @@
 # Senior review and follow-ups
 
-This is a source review, not a successful compiler, test, crash-test, fuzz, or
-benchmark run. Cargo and rust-analyzer were unavailable in the review sandbox.
+The earlier source review was followed on 2026-11-08 by a successful stable
+build, strict Clippy, full check suite, property/fault tests, 200 crash iterations,
+and debug/release concurrency tests. Fuzzing and benchmarks remain incomplete.
 Third-party dependencies and their transitive native code were not audited.
 
 ## Unsafe and panic inventory
@@ -82,8 +83,10 @@ Third-party dependencies and their transitive native code were not audited.
 - Opening now rejects SSTables when both `CURRENT` and the manifest are missing,
   rather than silently initializing an empty database. There is not yet a tool
   to reconstruct a lost manifest from otherwise recoverable files.
-- Install the pinned toolchain locally when DNS is available; then run
-  `scripts/check.sh`, property tests, the 200-iteration crash harness, 10-second
-  concurrency tests in debug/release, all fuzz targets, and benchmarks. Fix and
-  retain any discovered regressions rather than assuming this review proves
-  correctness.
+- Complete the full-duration fuzz runs and benchmarks, and fix and retain any
+  discovered regressions. A bounded WAL fuzz smoke attempt hung at startup and
+  was terminated; see `FUZZING.md`. Passing tests do not prove correctness.
+- `cargo package --list --allow-dirty --locked` includes the MIT license but
+  omits the nested fuzz workspace; if publishing to crates.io, decide how to
+  distribute those targets. Set repository/documentation URLs after the parent
+  creates the actual public repository rather than guessing them now.

@@ -41,8 +41,11 @@ needed; never remove regression fixtures or user files.
 
 ## Current verification
 
-The targets have not been run here: neither Cargo nor a Rust toolchain is
-available, and the project-local toolchain download failed DNS resolution. No
+On 2026-11-08, the pinned nightly and cargo-fuzz 0.12.0 were installed locally,
+and all three targets built. A WAL smoke run with `-max_total_time=5` did not exit
+and was terminated at a 180-second safety cap. A direct `-runs=1` invocation
+also timed out after 15 seconds before emitting libFuzzer output. SSTable and
+manifest execution and the required ten-minute runs remain unverified; no
 fuzz-discovered crashes or minimized artifacts are claimed. The normal WAL test
 includes a regression for an allocation issue found by inspection: a torn record
 with a large declared payload must be consumed in bounded chunks.

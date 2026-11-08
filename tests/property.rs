@@ -17,14 +17,20 @@ impl TestDir {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
         fs::create_dir_all(&root).unwrap();
-        let path = root.join(format!("property-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let path = root.join(format!(
+            "property-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
 
 impl Drop for TestDir {
-    fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +77,9 @@ fn operation() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn key(value: u8) -> Vec<u8> { vec![value] }
+fn key(value: u8) -> Vec<u8> {
+    vec![value]
+}
 
 fn bounds(start: u8, end: u8) -> std::ops::Range<Vec<u8>> {
     key(start.min(end))..key(start.max(end))
@@ -89,14 +97,28 @@ fn run_epoch(db: &Db, model: &mut ModelDb, operations: &[Op]) -> TestCaseResult 
                 db.delete(key(*k)).unwrap();
                 model.delete(key(*k)).unwrap();
             }
-            Op::Get(k) => prop_assert_eq!(db.get(key(*k)).unwrap(), model.get(key(*k)).unwrap(), "operation {:?}", operation),
-            Op::Scan(start, end) => prop_assert_eq!(db.scan(bounds(*start, *end)).unwrap(), model.scan(bounds(*start, *end)).unwrap(), "operation {:?}", operation),
+            Op::Get(k) => prop_assert_eq!(
+                db.get(key(*k)).unwrap(),
+                model.get(key(*k)).unwrap(),
+                "operation {:?}",
+                operation
+            ),
+            Op::Scan(start, end) => prop_assert_eq!(
+                db.scan(bounds(*start, *end)).unwrap(),
+                model.scan(bounds(*start, *end)).unwrap(),
+                "operation {:?}",
+                operation
+            ),
             Op::Batch(mutations) => {
                 let mut batch = WriteBatch::new();
                 for mutation in mutations {
                     match mutation {
-                        Mutation::Put(k, value) => { batch.put(key(*k), value); }
-                        Mutation::Delete(k) => { batch.delete(key(*k)); }
+                        Mutation::Put(k, value) => {
+                            batch.put(key(*k), value);
+                        }
+                        Mutation::Delete(k) => {
+                            batch.delete(key(*k));
+                        }
                     }
                 }
                 db.write(batch).unwrap();
@@ -108,29 +130,61 @@ fn run_epoch(db: &Db, model: &mut ModelDb, operations: &[Op]) -> TestCaseResult 
                 }
             }
             Op::Snapshot => {
-                if snapshots.len() == 8 { snapshots.remove(0); }
+                if snapshots.len() == 8 {
+                    snapshots.remove(0);
+                }
                 snapshots.push((db.snapshot().unwrap(), model.clone()));
             }
             Op::SnapshotGet(index, k) => {
                 if !snapshots.is_empty() {
-                    let (snapshot, reference): &(_, ModelDb) = &snapshots[*index as usize % snapshots.len()];
-                    prop_assert_eq!(snapshot.get(key(*k)).unwrap(), reference.get(key(*k)).unwrap(), "operation {:?}", operation);
+                    let (snapshot, reference): &(_, ModelDb) =
+                        &snapshots[*index as usize % snapshots.len()];
+                    prop_assert_eq!(
+                        snapshot.get(key(*k)).unwrap(),
+                        reference.get(key(*k)).unwrap(),
+                        "operation {:?}",
+                        operation
+                    );
                 }
             }
             Op::SnapshotScan(index, start, end) => {
                 if !snapshots.is_empty() {
-                    let (snapshot, reference): &(_, ModelDb) = &snapshots[*index as usize % snapshots.len()];
-                    prop_assert_eq!(snapshot.scan(bounds(*start, *end)).unwrap(), reference.scan(bounds(*start, *end)).unwrap(), "operation {:?}", operation);
+                    let (snapshot, reference): &(_, ModelDb) =
+                        &snapshots[*index as usize % snapshots.len()];
+                    prop_assert_eq!(
+                        snapshot.scan(bounds(*start, *end)).unwrap(),
+                        reference.scan(bounds(*start, *end)).unwrap(),
+                        "operation {:?}",
+                        operation
+                    );
                 }
             }
             Op::Flush => db.flush().unwrap(),
             Op::Compact => db.compact().unwrap(),
             Op::Reopen => unreachable!("reopen splits epochs"),
         }
-        prop_assert_eq!(db.scan(..).unwrap(), model.scan(..).unwrap(), "operation {:?}", operation);
-        for k in 0..8 { prop_assert_eq!(db.get(key(k)).unwrap(), model.get(key(k)).unwrap(), "key {} after {:?}", k, operation); }
+        prop_assert_eq!(
+            db.scan(..).unwrap(),
+            model.scan(..).unwrap(),
+            "operation {:?}",
+            operation
+        );
+        for k in 0..8 {
+            prop_assert_eq!(
+                db.get(key(k)).unwrap(),
+                model.get(key(k)).unwrap(),
+                "key {} after {:?}",
+                k,
+                operation
+            );
+        }
         for (snapshot, reference) in &snapshots {
-            prop_assert_eq!(snapshot.scan(..).unwrap(), reference.scan(..).unwrap(), "snapshot after {:?}", operation);
+            prop_assert_eq!(
+                snapshot.scan(..).unwrap(),
+                reference.scan(..).unwrap(),
+                "snapshot after {:?}",
+                operation
+            );
         }
     }
     Ok(())
@@ -182,13 +236,31 @@ fn model_sequence_exercises_every_operation() {
 #[test]
 fn explicit_controls_flush_and_compact_real_data() {
     let dir = TestDir::new();
-    let options = Options { memtable_size: 4096, target_file_size: 256, ..Options::default() };
+    let options = Options {
+        memtable_size: 4096,
+        target_file_size: 256,
+        ..Options::default()
+    };
     let db = Db::open(&dir.0, options).unwrap();
     db.put(key(1), b"value").unwrap();
     db.flush().unwrap();
-    assert!(db.stats().bytes_written_per_level.get(&0).copied().unwrap_or(0) > 0);
+    assert!(
+        db.stats()
+            .bytes_written_per_level
+            .get(&0)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
     db.compact().unwrap();
-    assert!(db.stats().bytes_written_per_level.get(&1).copied().unwrap_or(0) > 0);
+    assert!(
+        db.stats()
+            .bytes_written_per_level
+            .get(&1)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
     assert_eq!(db.get(key(1)).unwrap(), Some(b"value".to_vec()));
 }
 

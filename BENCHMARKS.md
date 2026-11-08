@@ -13,6 +13,10 @@ Observed on 2026-11-07 in this repository's sandbox:
   no compiler version was observed. The toolchain download failed because
   `static.rust-lang.org` could not be resolved.
 
+On 2026-11-08 DNS was restored and the pinned Rust 1.85.1 toolchain was installed
+project-locally. The historical measurements below remain unrun; no benchmark
+result or profile was produced during the licensing/verification pass.
+
 ## Workloads and method
 
 `benches/workloads.rs` uses Criterion 0.5.1 and a fresh, project-local database

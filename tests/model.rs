@@ -8,11 +8,7 @@ use lsmkv::{Error, Options};
 fn model_matches_latest_memtable_values() -> Result<(), Error> {
     let mut model = ModelDb::open("unused", Options::default())?;
     let mut table = BTreeMemtable::default();
-    for (seq, key, value) in [
-        (1, b"a", b"one"),
-        (2, b"b", b"two"),
-        (3, b"a", b"new"),
-    ] {
+    for (seq, key, value) in [(1, b"a", b"one"), (2, b"b", b"two"), (3, b"a", b"new")] {
         model.put(key, value)?;
         table.insert(
             InternalKey::new(key.to_vec(), seq, Kind::Put),
@@ -20,10 +16,7 @@ fn model_matches_latest_memtable_values() -> Result<(), Error> {
         );
     }
     model.delete(b"b")?;
-    table.insert(
-        InternalKey::new(b"b".to_vec(), 4, Kind::Delete),
-        Vec::new(),
-    );
+    table.insert(InternalKey::new(b"b".to_vec(), 4, Kind::Delete), Vec::new());
     for key in [b"a", b"b", b"c"] {
         assert_eq!(
             model.get(key)?,

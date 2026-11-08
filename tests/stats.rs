@@ -11,13 +11,19 @@ impl TestDir {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
         fs::create_dir_all(&root).unwrap();
-        let path = root.join(format!("stats-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let path = root.join(format!(
+            "stats-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
 impl Drop for TestDir {
-    fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
 }
 
 #[test]

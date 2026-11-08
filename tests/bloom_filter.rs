@@ -15,20 +15,29 @@ impl TestDir {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/tmp");
         fs::create_dir_all(&root).unwrap();
-        let path = root.join(format!("bloom-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let path = root.join(format!(
+            "bloom-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
 
 impl Drop for TestDir {
-    fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
 }
 
 #[test]
 fn negative_filter_lookups_update_shared_db_stats() {
     let dir = TestDir::new();
-    let options = Options { block_cache_capacity: 0, ..Options::default() };
+    let options = Options {
+        block_cache_capacity: 0,
+        ..Options::default()
+    };
     let db = Db::open(&dir.0, options.clone()).unwrap();
     let path = dir.0.join("table.sst");
     let mut writer = SstableWriter::with_options(Vec::new(), &options).unwrap();
@@ -55,7 +64,10 @@ fn negative_filter_lookups_update_shared_db_stats() {
 #[test]
 fn zero_bits_produces_compatible_empty_filter_and_invalid_configuration_fails() {
     let dir = TestDir::new();
-    let options = Options { bloom_bits_per_key: 0, ..Options::default() };
+    let options = Options {
+        bloom_bits_per_key: 0,
+        ..Options::default()
+    };
     let db = Db::open(&dir.0, options.clone()).unwrap();
     let path = dir.0.join("legacy.sst");
     let mut writer = SstableWriter::with_options(Vec::new(), &options).unwrap();
@@ -64,9 +76,17 @@ fn zero_bits_produces_compatible_empty_filter_and_invalid_configuration_fails() 
     fs::write(&path, writer.finish().unwrap()).unwrap();
     let reader = SstableReader::open(path, Arc::new(BlockCache::new(&options))).unwrap();
     assert_eq!(reader.get(&key).unwrap(), Some(b"value".to_vec()));
-    assert_eq!(reader.get(&InternalKey::new(b"a".to_vec(), 1, Kind::Put)).unwrap(), None);
+    assert_eq!(
+        reader
+            .get(&InternalKey::new(b"a".to_vec(), 1, Kind::Put))
+            .unwrap(),
+        None
+    );
     assert_eq!(db.stats().bloom_filter_block_reads_avoided, 0);
-    let invalid = Options { bloom_bits_per_key: 31, ..Options::default() };
+    let invalid = Options {
+        bloom_bits_per_key: 31,
+        ..Options::default()
+    };
     assert!(SstableWriter::with_options(Vec::new(), &invalid).is_err());
 }
 

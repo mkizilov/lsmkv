@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
+use std::ops::Deref;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -16,20 +16,20 @@ use memtable::{BTreeMemtable, InternalKey, Kind, Lookup, Memtable};
 use sstable::{BlockCache, SstableReader};
 use wal::{Operation, SyncPolicy, WalReader, WalWriter};
 
-pub mod memtable;
-pub mod encoding;
-pub mod sstable;
-pub mod wal;
-pub mod fs;
 pub mod benchmark;
+mod compaction;
+pub mod encoding;
+mod flush;
+pub mod fs;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 mod manifest;
-mod flush;
+pub mod memtable;
 mod merge;
-mod compaction;
 #[cfg(test)]
 mod read_tests;
+pub mod sstable;
+pub mod wal;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -124,7 +124,10 @@ pub struct VerifyReport {
 
 impl Statistics {
     fn record_level(&self, level: u32, bytes: u64) -> Result<(), Error> {
-        let mut levels = self.bytes_written_per_level.lock().map_err(|_| Error::Poisoned)?;
+        let mut levels = self
+            .bytes_written_per_level
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
         let total = levels.entry(level).or_default();
         *total = total.saturating_add(bytes);
         Ok(())
@@ -142,20 +145,26 @@ struct Table {
 
 impl Deref for Table {
     type Target = SstableReader;
-    fn deref(&self) -> &Self::Target { &self.reader }
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
 }
 
 impl Drop for Table {
     fn drop(&mut self) {
         if self.obsolete.load(Ordering::Acquire) {
             if let Err(error) = self.fs.remove_file(&self.path) {
-                eprintln!("failed to remove obsolete SSTable {}: {error}", self.path.display());
+                eprintln!(
+                    "failed to remove obsolete SSTable {}: {error}",
+                    self.path.display()
+                );
             }
         }
     }
 }
 
 type TableVersion = BTreeMap<u32, Vec<Arc<Table>>>;
+type RetiredResources = (Vec<Arc<Table>>, Option<Arc<BTreeMemtable>>);
 
 pub type Entry = (Vec<u8>, Vec<u8>);
 
@@ -176,7 +185,10 @@ impl WriteBatch {
     }
 
     pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> &mut Self {
-        self.mutations.push(Mutation::Put(key.as_ref().to_vec(), value.as_ref().to_vec()));
+        self.mutations.push(Mutation::Put(
+            key.as_ref().to_vec(),
+            value.as_ref().to_vec(),
+        ));
         self
     }
 
@@ -207,7 +219,10 @@ struct State {
     rotating: bool,
 }
 
-enum MaintenanceSignal { Finished, Stop }
+enum MaintenanceSignal {
+    Finished,
+    Stop,
+}
 
 struct NotifyOnDrop(Sender<MaintenanceSignal>, Arc<Condvar>);
 
@@ -219,7 +234,11 @@ impl Drop for NotifyOnDrop {
 }
 
 enum Background {
-    Flush { handle: JoinHandle<Result<flush::Output, Error>>, number: u64, sequence: u64 },
+    Flush {
+        handle: JoinHandle<Result<flush::Output, Error>>,
+        number: u64,
+        sequence: u64,
+    },
     Compaction(JoinHandle<Result<compaction::Output, Error>>),
 }
 
@@ -238,22 +257,39 @@ impl State {
     }
 
     fn schedule_compaction_mode(&mut self, force: bool) -> Result<bool, Error> {
-        if self.pending.is_some() || self.rotating || self.write_failed { return Ok(false); }
+        if self.pending.is_some() || self.rotating || self.write_failed {
+            return Ok(false);
+        }
         let mut chosen = None;
         if force {
-            chosen = self.tables.iter().find(|(_, files)| !files.is_empty()).map(|(&level, _)| level);
+            chosen = self
+                .tables
+                .iter()
+                .find(|(_, files)| !files.is_empty())
+                .map(|(&level, _)| level);
         } else if self.tables.get(&0).map_or(0, Vec::len) > self.options.l0_compaction_trigger {
             chosen = Some(0);
         } else {
             for (&level, files) in self.tables.iter() {
-                if level == 0 || files.is_empty() { continue; }
+                if level == 0 || files.is_empty() {
+                    continue;
+                }
                 let mut target = self.options.target_file_size;
-                for _ in 0..level.min(20) { target = target.saturating_mul(10); }
-                let size = files.iter().fold(0u64, |sum, file| sum.saturating_add(file.size));
-                if size > target { chosen = Some(level); break; }
+                for _ in 0..level.min(20) {
+                    target = target.saturating_mul(10);
+                }
+                let size = files
+                    .iter()
+                    .fold(0u64, |sum, file| sum.saturating_add(file.size));
+                if size > target {
+                    chosen = Some(level);
+                    break;
+                }
             }
         }
-        let Some(level) = chosen else { return Ok(false); };
+        let Some(level) = chosen else {
+            return Ok(false);
+        };
         let destination = level.checked_add(1).ok_or(Error::SequenceExhausted)?;
         let mut inputs = Vec::new();
         let mut removed = Vec::new();
@@ -265,41 +301,74 @@ impl State {
                 }
             }
         }
-        let bottom = !self.tables.iter().any(|(&other, files)| other > destination && !files.is_empty());
+        let bottom = !self
+            .tables
+            .iter()
+            .any(|(&other, files)| other > destination && !files.is_empty());
         let job = compaction::Job {
-            dir: self.dir.clone(), inputs, removed, level: destination,
-            next_file: self.next_file, last_sequence: self.flushed_sequence,
-            snapshots: self.snapshots.keys().copied().collect(), bottom,
-            options: self.options.clone(), cache: Arc::clone(&self.cache),
+            dir: self.dir.clone(),
+            inputs,
+            removed,
+            level: destination,
+            next_file: self.next_file,
+            last_sequence: self.flushed_sequence,
+            snapshots: self.snapshots.keys().copied().collect(),
+            bottom,
+            options: self.options.clone(),
+            cache: Arc::clone(&self.cache),
         };
         let notify = self.notify.clone();
         let maintenance_cv = Arc::clone(&self.maintenance_cv);
         self.pending = Some(Background::Compaction(
-            thread::Builder::new().name("lsmkv-compaction".into()).spawn(move || {
-                let _notification = NotifyOnDrop(notify, maintenance_cv);
-                compaction::run(job)
-            })?,
+            thread::Builder::new()
+                .name("lsmkv-compaction".into())
+                .spawn(move || {
+                    let _notification = NotifyOnDrop(notify, maintenance_cv);
+                    compaction::run(job)
+                })?,
         ));
         Ok(true)
     }
 
-    fn finish_flush(&mut self, wait: bool) -> Result<(Vec<Arc<Table>>, Option<Arc<BTreeMemtable>>), Error> {
-        if !self.pending.as_ref().is_some_and(|job| wait || job.is_finished()) {
+    fn finish_flush(&mut self, wait: bool) -> Result<RetiredResources, Error> {
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|job| wait || job.is_finished())
+        {
             return Ok((Vec::new(), None));
         }
-        let Some(job) = self.pending.take() else { return Ok((Vec::new(), None)); };
-        let result: Result<(Vec<Arc<Table>>, Option<Arc<BTreeMemtable>>), Error> = (|| match job {
-            Background::Flush { handle, number, sequence } => {
-                let output = handle.join().map_err(|_| io::Error::other("flush thread panicked"))??;
+        let Some(job) = self.pending.take() else {
+            return Ok((Vec::new(), None));
+        };
+        let result: Result<RetiredResources, Error> = (|| match job {
+            Background::Flush {
+                handle,
+                number,
+                sequence,
+            } => {
+                let output = handle
+                    .join()
+                    .map_err(|_| io::Error::other("flush thread panicked"))??;
                 let path = flush::table_path(&self.dir, number);
-                Arc::make_mut(&mut self.tables).entry(0).or_default().push(Arc::new(Table {
-                    reader: output.reader, number, path, size: output.size, obsolete: AtomicBool::new(false), fs: Arc::clone(&self.options.fs),
-                }));
+                Arc::make_mut(&mut self.tables)
+                    .entry(0)
+                    .or_default()
+                    .push(Arc::new(Table {
+                        reader: output.reader,
+                        number,
+                        path,
+                        size: output.size,
+                        obsolete: AtomicBool::new(false),
+                        fs: Arc::clone(&self.options.fs),
+                    }));
                 self.flushed_sequence = sequence;
                 Ok((Vec::new(), self.frozen.take()))
             }
             Background::Compaction(handle) => {
-                let output = handle.join().map_err(|_| io::Error::other("compaction thread panicked"))??;
+                let output = handle
+                    .join()
+                    .map_err(|_| io::Error::other("compaction thread panicked"))??;
                 let levels = Arc::make_mut(&mut self.tables);
                 let mut retired = Vec::new();
                 for (level, number) in &output.removed {
@@ -312,7 +381,11 @@ impl State {
                 }
                 levels.entry(output.level).or_default().extend(output.files);
                 if let Some(files) = levels.get_mut(&output.level) {
-                    files.sort_by(|a, b| a.user_key_bounds().map(|(first, _)| first).cmp(&b.user_key_bounds().map(|(first, _)| first)));
+                    files.sort_by(|a, b| {
+                        a.user_key_bounds()
+                            .map(|(first, _)| first)
+                            .cmp(&b.user_key_bounds().map(|(first, _)| first))
+                    });
                 }
                 self.next_file = output.next_file;
                 Ok((retired, None))
@@ -327,7 +400,13 @@ impl State {
         }
     }
 
-    fn install_rotation(&mut self, new_wal: Arc<WalWriter>, new_path: PathBuf, table_number: u64, next_file: u64) -> Result<Arc<WalWriter>, Error> {
+    fn install_rotation(
+        &mut self,
+        new_wal: Arc<WalWriter>,
+        new_path: PathBuf,
+        table_number: u64,
+        next_file: u64,
+    ) -> Result<Arc<WalWriter>, Error> {
         let job = flush::FlushJob {
             dir: self.dir.clone(),
             table: Arc::clone(&self.table),
@@ -341,15 +420,21 @@ impl State {
         let sequence = job.last_sequence;
         let notify = self.notify.clone();
         let maintenance_cv = Arc::clone(&self.maintenance_cv);
-        let handle = thread::Builder::new().name("lsmkv-flush".into()).spawn(move || {
-            let _notification = NotifyOnDrop(notify, maintenance_cv);
-            flush::run(job)
-        })?;
+        let handle = thread::Builder::new()
+            .name("lsmkv-flush".into())
+            .spawn(move || {
+                let _notification = NotifyOnDrop(notify, maintenance_cv);
+                flush::run(job)
+            })?;
         let old_wal = std::mem::replace(&mut self.wal, new_wal);
         self.wal_paths = vec![new_path];
         self.frozen = Some(std::mem::take(&mut self.table));
         self.next_file = next_file;
-        self.pending = Some(Background::Flush { handle, number: table_number, sequence });
+        self.pending = Some(Background::Flush {
+            handle,
+            number: table_number,
+            sequence,
+        });
         Ok(old_wal)
     }
 }
@@ -371,9 +456,16 @@ struct WriteRequest {
     reply: Sender<WriteResponse>,
 }
 
-enum WriteWork { Batch(WriteBatch), Flush, Compact }
+enum WriteWork {
+    Batch(WriteBatch),
+    Flush,
+    Compact,
+}
 
-enum WriteResponse { Lead, Complete(Result<(), Error>) }
+enum WriteResponse {
+    Lead,
+    Complete(Result<(), Error>),
+}
 
 #[derive(Default)]
 struct WriteQueue {
@@ -384,22 +476,43 @@ struct WriteQueue {
 impl Db {
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
         if options.bloom_bits_per_key > 30 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bloom bits per key must be at most 30").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bloom bits per key must be at most 30",
+            )
+            .into());
         }
-        if options.target_file_size == 0 || options.l0_stop_writes_trigger <= options.l0_compaction_trigger {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid compaction settings").into());
+        if options.target_file_size == 0
+            || options.l0_stop_writes_trigger <= options.l0_compaction_trigger
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid compaction settings").into(),
+            );
         }
         let path = path.as_ref();
         options.fs.create_dir_all(path)?;
-        let lock = options.fs.open(&path.join("LOCK"), FileOptions::new().read(true).write(true).create(true).truncate(false))?;
+        let lock = options.fs.open(
+            &path.join("LOCK"),
+            FileOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )?;
         match lock.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(Error::Locked),
             Err(error) => return Err(error.into()),
         }
-        if !options.fs.exists(&path.join("CURRENT"))? && !options.fs.exists(&path.join("MANIFEST-000001"))? {
+        if !options.fs.exists(&path.join("CURRENT"))?
+            && !options.fs.exists(&path.join("MANIFEST-000001"))?
+        {
             for existing in options.fs.read_dir(path)? {
-                if existing.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("SST-") && name.ends_with(".sst")) {
+                if existing
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("SST-") && name.ends_with(".sst"))
+                {
                     return Err(Error::Corruption("SSTables exist without a manifest"));
                 }
             }
@@ -411,66 +524,109 @@ impl Db {
             let table_path = flush::table_path(path, number);
             let size = options.fs.len(&table_path)?;
             let reader = SstableReader::open(&table_path, Arc::clone(&cache))?;
-            let table = Arc::new(Table { reader, number, path: table_path, size, obsolete: AtomicBool::new(false), fs: Arc::clone(&options.fs) });
+            let table = Arc::new(Table {
+                reader,
+                number,
+                path: table_path,
+                size,
+                obsolete: AtomicBool::new(false),
+                fs: Arc::clone(&options.fs),
+            });
             if level != 0 && table.user_key_bounds().is_none() {
                 return Err(Error::Corruption("empty deeper-level table"));
             }
             tables.entry(level).or_default().push(table);
         }
         for (&level, files) in &mut tables {
-            if level == 0 { continue; }
-            files.sort_by(|a, b| a.user_key_bounds().map(|(first, _)| first).cmp(&b.user_key_bounds().map(|(first, _)| first)));
+            if level == 0 {
+                continue;
+            }
+            files.sort_by(|a, b| {
+                a.user_key_bounds()
+                    .map(|(first, _)| first)
+                    .cmp(&b.user_key_bounds().map(|(first, _)| first))
+            });
             for pair in files.windows(2) {
-                let (_, previous_last) = pair[0].user_key_bounds().ok_or(Error::Corruption("empty deeper-level table"))?;
-                let (next_first, _) = pair[1].user_key_bounds().ok_or(Error::Corruption("empty deeper-level table"))?;
-                if previous_last >= next_first { return Err(Error::Corruption("overlapping table ranges")); }
+                let (_, previous_last) = pair[0]
+                    .user_key_bounds()
+                    .ok_or(Error::Corruption("empty deeper-level table"))?;
+                let (next_first, _) = pair[1]
+                    .user_key_bounds()
+                    .ok_or(Error::Corruption("empty deeper-level table"))?;
+                if previous_last >= next_first {
+                    return Err(Error::Corruption("overlapping table ranges"));
+                }
             }
         }
-        let (table, wal_paths, wal, next_sequence, next_file) = recover(path, &version, options.sync_policy, Arc::clone(&options.fs))?;
+        let (table, wal_paths, wal, next_sequence, next_file) =
+            recover(path, &version, options.sync_policy, Arc::clone(&options.fs))?;
         let (notify, receiver) = mpsc::channel();
         let maintenance_cv = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(State {
-                table: Arc::new(table), wal: Arc::new(wal), next_sequence, write_failed: false,
-                dir: path.to_path_buf(), options: options.clone(), cache, tables: Arc::new(tables),
-                frozen: None, pending: None, wal_paths, next_file,
-                flushed_sequence: version.last_sequence, snapshots: BTreeMap::new(),
-                notify, closing: false, maintenance_cv: Arc::clone(&maintenance_cv), rotating: false,
-            }));
+            table: Arc::new(table),
+            wal: Arc::new(wal),
+            next_sequence,
+            write_failed: false,
+            dir: path.to_path_buf(),
+            options: options.clone(),
+            cache,
+            tables: Arc::new(tables),
+            frozen: None,
+            pending: None,
+            wal_paths,
+            next_file,
+            flushed_sequence: version.last_sequence,
+            snapshots: BTreeMap::new(),
+            notify,
+            closing: false,
+            maintenance_cv: Arc::clone(&maintenance_cv),
+            rotating: false,
+        }));
         let weak = Arc::downgrade(&state);
         let coordinator_cv = Arc::clone(&maintenance_cv);
-        let coordinator = thread::Builder::new().name("lsmkv-maintenance".into()).spawn(move || {
-            while let Ok(signal) = receiver.recv() {
-                if matches!(signal, MaintenanceSignal::Stop) { break; }
-                let Some(state) = weak.upgrade() else { break };
-                let mut state = match state.lock() {
-                    Ok(state) => state,
-                    Err(error) => { eprintln!("maintenance mutex poisoned"); error.into_inner() }
-                };
-                while state.pending.as_ref().is_some_and(|job| !job.is_finished()) {
-                    state = match coordinator_cv.wait_timeout(state, Duration::from_millis(2)) {
-                        Ok((state, _)) => state,
-                        Err(error) => { eprintln!("maintenance mutex poisoned"); error.into_inner().0 }
+        let coordinator = thread::Builder::new()
+            .name("lsmkv-maintenance".into())
+            .spawn(move || {
+                while let Ok(signal) = receiver.recv() {
+                    if matches!(signal, MaintenanceSignal::Stop) {
+                        break;
+                    }
+                    let Some(state) = weak.upgrade() else { break };
+                    let mut state = match state.lock() {
+                        Ok(state) => state,
+                        Err(error) => {
+                            eprintln!("maintenance mutex poisoned");
+                            error.into_inner()
+                        }
                     };
-                }
-                let retired = match state.finish_flush(false) {
-                    Ok(retired) => retired,
-                    Err(error) => {
-                        state.write_failed = true;
-                        eprintln!("background maintenance failed: {error}");
-                        (Vec::new(), None)
+                    while state.pending.as_ref().is_some_and(|job| !job.is_finished()) {
+                        state = match coordinator_cv.wait_timeout(state, Duration::from_millis(2)) {
+                            Ok((state, _)) => state,
+                            Err(error) => {
+                                eprintln!("maintenance mutex poisoned");
+                                error.into_inner().0
+                            }
+                        };
                     }
-                };
-                if !state.closing {
-                if let Err(error) = state.schedule_compaction() {
-                        state.write_failed = true;
-                        eprintln!("background maintenance failed: {error}");
+                    let retired = match state.finish_flush(false) {
+                        Ok(retired) => retired,
+                        Err(error) => {
+                            state.write_failed = true;
+                            eprintln!("background maintenance failed: {error}");
+                            (Vec::new(), None)
+                        }
+                    };
+                    if !state.closing {
+                        if let Err(error) = state.schedule_compaction() {
+                            state.write_failed = true;
+                            eprintln!("background maintenance failed: {error}");
+                        }
                     }
+                    coordinator_cv.notify_all();
+                    drop(state);
+                    drop(retired);
                 }
-                coordinator_cv.notify_all();
-                drop(state);
-                drop(retired);
-            }
-        })?;
+            })?;
         let db = Self {
             state,
             _lock: lock,
@@ -493,7 +649,9 @@ impl Db {
 
     /// Commit a batch atomically. Empty batches are a no-op.
     pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
-        if batch.mutations.is_empty() { return Ok(()); }
+        if batch.mutations.is_empty() {
+            return Ok(());
+        }
         let size = batch_size(&batch)?;
         self.enqueue(WriteWork::Batch(batch), size)
     }
@@ -514,11 +672,21 @@ impl Db {
             let mut queue = self.write_queue.lock().map_err(|_| Error::Poisoned)?;
             queue.pending.push_back(WriteRequest { work, size, reply });
             self.write_cv.notify_one();
-            if queue.leader { false } else { queue.leader = true; true }
+            if queue.leader {
+                false
+            } else {
+                queue.leader = true;
+                true
+            }
         };
-        if leader { self.run_write_queue(); }
+        if leader {
+            self.run_write_queue();
+        }
         loop {
-            match receiver.recv().map_err(|_| io::Error::other("write queue stopped"))? {
+            match receiver
+                .recv()
+                .map_err(|_| io::Error::other("write queue stopped"))?
+            {
                 WriteResponse::Lead => self.run_write_queue(),
                 WriteResponse::Complete(result) => return result,
             }
@@ -526,80 +694,117 @@ impl Db {
     }
 
     fn run_write_queue(&self) {
-            let mut queue = match self.write_queue.lock() {
-                Ok(queue) => queue,
-                Err(error) => {
-                    let mut queue = error.into_inner();
-                    for request in queue.pending.drain(..) { let _ = request.reply.send(WriteResponse::Complete(Err(Error::Poisoned))); }
-                    queue.leader = false;
-                    return;
+        let mut queue = match self.write_queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => {
+                let mut queue = error.into_inner();
+                for request in queue.pending.drain(..) {
+                    let _ = request
+                        .reply
+                        .send(WriteResponse::Complete(Err(Error::Poisoned)));
                 }
-            };
-            if queue.pending.is_empty() { queue.leader = false; return; }
-            if queue.pending.len() == 1 && queue.pending.front().is_some_and(|next| matches!(&next.work, WriteWork::Batch(_))) {
-                queue = match self.write_cv.wait_timeout(queue, Duration::from_millis(1)) {
-                    Ok((queue, _)) => queue,
-                    Err(error) => error.into_inner().0,
-                };
+                queue.leader = false;
+                return;
             }
-            let Some(first) = queue.pending.pop_front() else { queue.leader = false; return; };
-            let WriteRequest { work, size: first_size, reply } = first;
-            let mut replies = vec![reply];
-            let mut combined = WriteBatch::new();
-            let is_batch = matches!(&work, WriteWork::Batch(_));
-            let work = match work {
-                WriteWork::Batch(batch) => {
-                    combined.mutations.extend(batch.mutations);
-                    let mut size = 4 + first_size;
-                    while replies.len() < 256 {
-                        let Some(next) = queue.pending.front() else { break };
-                        let WriteWork::Batch(batch) = &next.work else { break };
-                        if size + next.size > wal::MAX_PAYLOAD
-                            || combined.mutations.len() + batch.mutations.len() > u32::MAX as usize { break; }
-                        size += next.size;
-                        if let Some(request) = queue.pending.pop_front() {
-                            if let WriteWork::Batch(batch) = request.work {
-                                combined.mutations.extend(batch.mutations);
-                                replies.push(request.reply);
-                            }
+        };
+        if queue.pending.is_empty() {
+            queue.leader = false;
+            return;
+        }
+        if queue.pending.len() == 1
+            && queue
+                .pending
+                .front()
+                .is_some_and(|next| matches!(&next.work, WriteWork::Batch(_)))
+        {
+            queue = match self.write_cv.wait_timeout(queue, Duration::from_millis(1)) {
+                Ok((queue, _)) => queue,
+                Err(error) => error.into_inner().0,
+            };
+        }
+        let Some(first) = queue.pending.pop_front() else {
+            queue.leader = false;
+            return;
+        };
+        let WriteRequest {
+            work,
+            size: first_size,
+            reply,
+        } = first;
+        let mut replies = vec![reply];
+        let mut combined = WriteBatch::new();
+        let is_batch = matches!(&work, WriteWork::Batch(_));
+        let work = match work {
+            WriteWork::Batch(batch) => {
+                combined.mutations.extend(batch.mutations);
+                let mut size = 4 + first_size;
+                while replies.len() < 256 {
+                    let Some(next) = queue.pending.front() else {
+                        break;
+                    };
+                    let WriteWork::Batch(batch) = &next.work else {
+                        break;
+                    };
+                    if size + next.size > wal::MAX_PAYLOAD
+                        || combined.mutations.len() + batch.mutations.len() > u32::MAX as usize
+                    {
+                        break;
+                    }
+                    size += next.size;
+                    if let Some(request) = queue.pending.pop_front() {
+                        if let WriteWork::Batch(batch) = request.work {
+                            combined.mutations.extend(batch.mutations);
+                            replies.push(request.reply);
                         }
                     }
-                    WriteWork::Batch(combined)
                 }
-                other => other,
-            };
-            drop(queue);
-            let count = replies.len() as u64;
-            let result = match work {
-                WriteWork::Batch(batch) => self.commit_group(batch),
-                WriteWork::Flush => self.force_maintenance(false),
-                WriteWork::Compact => self.force_maintenance(true),
-            };
-            match result {
-                Ok(()) => {
-                    if is_batch {
-                        self.statistics.wal_group_commits.fetch_add(1, Ordering::Relaxed);
-                        self.statistics.committed_write_requests.fetch_add(count, Ordering::Relaxed);
-                    }
-                    for reply in replies { let _ = reply.send(WriteResponse::Complete(Ok(()))); }
+                WriteWork::Batch(combined)
+            }
+            other => other,
+        };
+        drop(queue);
+        let count = replies.len() as u64;
+        let result = match work {
+            WriteWork::Batch(batch) => self.commit_group(batch),
+            WriteWork::Flush => self.force_maintenance(false),
+            WriteWork::Compact => self.force_maintenance(true),
+        };
+        match result {
+            Ok(()) => {
+                if is_batch {
+                    self.statistics
+                        .wal_group_commits
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.statistics
+                        .committed_write_requests
+                        .fetch_add(count, Ordering::Relaxed);
                 }
-                Err(error) => {
-                    let mut error = Some(error);
-                    for reply in replies {
-                        let result = match error.take() { Some(error) => Err(error), None => Err(Error::WriteFailed) };
-                        let _ = reply.send(WriteResponse::Complete(result));
-                    }
+                for reply in replies {
+                    let _ = reply.send(WriteResponse::Complete(Ok(())));
                 }
             }
-            let mut queue = match self.write_queue.lock() {
-                Ok(queue) => queue,
-                Err(error) => error.into_inner(),
-            };
-            while let Some(next) = queue.pending.front() {
-                if next.reply.send(WriteResponse::Lead).is_ok() { return; }
-                queue.pending.pop_front();
+            Err(error) => {
+                let mut error = Some(error);
+                for reply in replies {
+                    let result = match error.take() {
+                        Some(error) => Err(error),
+                        None => Err(Error::WriteFailed),
+                    };
+                    let _ = reply.send(WriteResponse::Complete(result));
+                }
             }
-            queue.leader = false;
+        }
+        let mut queue = match self.write_queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => error.into_inner(),
+        };
+        while let Some(next) = queue.pending.front() {
+            if next.reply.send(WriteResponse::Lead).is_ok() {
+                return;
+            }
+            queue.pending.pop_front();
+        }
+        queue.leader = false;
     }
 
     fn force_maintenance(&self, compact: bool) -> Result<(), Error> {
@@ -617,32 +822,55 @@ impl Db {
         Ok(())
     }
 
-    fn wait_maintenance<'a>(&self, mut state: MutexGuard<'a, State>) -> Result<MutexGuard<'a, State>, Error> {
+    fn wait_maintenance<'a>(
+        &self,
+        mut state: MutexGuard<'a, State>,
+    ) -> Result<MutexGuard<'a, State>, Error> {
         while state.pending.is_some() || state.rotating {
-            if state.write_failed { return Err(Error::WriteFailed); }
-            state = self.maintenance_cv.wait_timeout(state, Duration::from_millis(5))
-                .map_err(|_| Error::Poisoned)?.0;
+            if state.write_failed {
+                return Err(Error::WriteFailed);
+            }
+            state = self
+                .maintenance_cv
+                .wait_timeout(state, Duration::from_millis(5))
+                .map_err(|_| Error::Poisoned)?
+                .0;
         }
-        if state.write_failed { return Err(Error::WriteFailed); }
+        if state.write_failed {
+            return Err(Error::WriteFailed);
+        }
         Ok(state)
     }
 
     fn commit_group(&self, batch: WriteBatch) -> Result<(), Error> {
         let mut state = self.state()?;
         loop {
-            if state.write_failed { return Err(Error::WriteFailed); }
+            if state.write_failed {
+                return Err(Error::WriteFailed);
+            }
             state.schedule_compaction()?;
-            if state.tables.get(&0).map_or(0, Vec::len) < state.options.l0_stop_writes_trigger { break; }
-            if state.pending.is_none() { return Err(Error::WriteFailed); }
+            if state.tables.get(&0).map_or(0, Vec::len) < state.options.l0_stop_writes_trigger {
+                break;
+            }
+            if state.pending.is_none() {
+                return Err(Error::WriteFailed);
+            }
             state = self.wait_maintenance(state)?;
         }
         let count = u64::try_from(batch.mutations.len()).map_err(|_| Error::SequenceExhausted)?;
-        let next = state.next_sequence.checked_add(count).ok_or(Error::SequenceExhausted)?;
+        let next = state
+            .next_sequence
+            .checked_add(count)
+            .ok_or(Error::SequenceExhausted)?;
         let mut sequence = state.next_sequence;
         let mut operations = Vec::with_capacity(batch.mutations.len());
         for mutation in batch.mutations {
             operations.push(match mutation {
-                Mutation::Put(key, value) => Operation::Put { sequence, key, value },
+                Mutation::Put(key, value) => Operation::Put {
+                    sequence,
+                    key,
+                    value,
+                },
                 Mutation::Delete(key) => Operation::Delete { sequence, key },
             });
             sequence += 1;
@@ -663,7 +891,11 @@ impl Db {
             state.write_failed = true;
             return Err(error.into());
         }
-        let _ = self.statistics.logical_bytes_written.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(logical_bytes)));
+        let _ = self.statistics.logical_bytes_written.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(logical_bytes)),
+        );
         for operation in operations {
             apply(Arc::make_mut(&mut state.table), operation);
         }
@@ -678,7 +910,9 @@ impl Db {
     fn rotate_and_flush(&self, mut state: MutexGuard<'_, State>) -> Result<(), Error> {
         let wal_number = state.next_file;
         let table_number = wal_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
-        let next_file = table_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
+        let next_file = table_number
+            .checked_add(1)
+            .ok_or(Error::SequenceExhausted)?;
         let path = flush::wal_path(&state.dir, wal_number);
         let dir = state.dir.clone();
         let policy = state.options.sync_policy;
@@ -691,12 +925,19 @@ impl Db {
             let file = fs.open(&path, FileOptions::new().write(true).create_new(true))?;
             file.sync_all()?;
             manifest::sync_dir(&dir, fs.as_ref())?;
-            Ok(Arc::new(WalWriter::open_with_fs(&path, policy, Arc::clone(&fs))?))
+            Ok(Arc::new(WalWriter::open_with_fs(
+                &path,
+                policy,
+                Arc::clone(&fs),
+            )?))
         })();
         let mut state = self.state()?;
-        let result = prepared.and_then(|wal| state.install_rotation(wal, path, table_number, next_file));
+        let result =
+            prepared.and_then(|wal| state.install_rotation(wal, path, table_number, next_file));
         state.rotating = false;
-        if result.is_err() { state.write_failed = true; }
+        if result.is_err() {
+            state.write_failed = true;
+        }
         self.maintenance_cv.notify_all();
         drop(state);
         drop(old);
@@ -741,7 +982,10 @@ impl Db {
                     table.user_key_bounds().is_some_and(|(_, last)| last < key)
                 });
                 if let Some(table) = files.get(position) {
-                    if table.user_key_bounds().is_some_and(|(first, last)| first <= key && key <= last) {
+                    if table
+                        .user_key_bounds()
+                        .is_some_and(|(first, last)| first <= key && key <= last)
+                    {
                         if let Some((kind, value)) = table.get_user_at(key, sequence)? {
                             return Ok(if kind == Kind::Put { Some(value) } else { None });
                         }
@@ -762,7 +1006,11 @@ impl Db {
         self.scan_at(range, u64::MAX)
     }
 
-    fn scan_at<R: RangeBounds<Vec<u8>>>(&self, range: R, sequence: u64) -> Result<Vec<Entry>, Error> {
+    fn scan_at<R: RangeBounds<Vec<u8>>>(
+        &self,
+        range: R,
+        sequence: u64,
+    ) -> Result<Vec<Entry>, Error> {
         let state = self.state()?;
         let active = Arc::clone(&state.table);
         let frozen = state.frozen.clone();
@@ -773,9 +1021,17 @@ impl Db {
         drop(state);
         let pin = Snapshot { db: self, sequence };
         let mut sources: Vec<merge::Source<'_>> = Vec::new();
-        sources.push(Box::new(active.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
+        sources.push(Box::new(
+            active
+                .entries()
+                .map(|(key, value)| Ok((key.clone(), value.clone()))),
+        ));
         if let Some(table) = &frozen {
-            sources.push(Box::new(table.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
+            sources.push(Box::new(
+                table
+                    .entries()
+                    .map(|(key, value)| Ok((key.clone(), value.clone()))),
+            ));
         }
         for files in tables.values() {
             for table in files {
@@ -785,7 +1041,9 @@ impl Db {
         let mut result = Vec::new();
         for entry in merge::MergeIterator::new(sources, sequence)? {
             let (key, value) = entry?;
-            if range.contains(&key) { result.push((key, value)); }
+            if range.contains(&key) {
+                result.push((key, value));
+            }
         }
         drop(pin);
         Ok(result)
@@ -802,14 +1060,18 @@ impl Db {
     /// Wait for all writes to reach stable storage.
     pub fn sync(&self) -> Result<(), Error> {
         let state = self.state()?;
-        if state.write_failed { return Err(Error::WriteFailed); }
+        if state.write_failed {
+            return Err(Error::WriteFailed);
+        }
         let wal = Arc::clone(&state.wal);
         drop(state);
         wal.sync()?;
         let mut state = self.state()?;
         loop {
             state = self.wait_maintenance(state)?;
-            if !state.schedule_compaction()? { break; }
+            if !state.schedule_compaction()? {
+                break;
+            }
         }
         Ok(())
     }
@@ -818,36 +1080,68 @@ impl Db {
     pub fn stats(&self) -> Stats {
         let levels = match self.statistics.bytes_written_per_level.lock() {
             Ok(levels) => levels.clone(),
-            Err(error) => { eprintln!("statistics mutex poisoned"); error.into_inner().clone() }
+            Err(error) => {
+                eprintln!("statistics mutex poisoned");
+                error.into_inner().clone()
+            }
         };
-        let logical = self.statistics.logical_bytes_written.load(Ordering::Relaxed);
-        let written = levels.values().fold(0u64, |total, bytes| total.saturating_add(*bytes));
+        let logical = self
+            .statistics
+            .logical_bytes_written
+            .load(Ordering::Relaxed);
+        let written = levels
+            .values()
+            .fold(0u64, |total, bytes| total.saturating_add(*bytes));
         let state = match self.state.lock() {
             Ok(state) => state,
-            Err(error) => { eprintln!("database mutex poisoned while collecting statistics"); error.into_inner() }
+            Err(error) => {
+                eprintln!("database mutex poisoned while collecting statistics");
+                error.into_inner()
+            }
         };
         let mut files_per_level = BTreeMap::new();
         let mut live_bytes_per_level = BTreeMap::new();
         for (&level, files) in state.tables.iter() {
-            if files.is_empty() { continue; }
+            if files.is_empty() {
+                continue;
+            }
             files_per_level.insert(level, files.len());
-            live_bytes_per_level.insert(level, files.iter().fold(0u64, |total, file| total.saturating_add(file.size)));
+            live_bytes_per_level.insert(
+                level,
+                files
+                    .iter()
+                    .fold(0u64, |total, file| total.saturating_add(file.size)),
+            );
         }
         let cache_hits = self.statistics.cache_hits.load(Ordering::Relaxed);
         let cache_misses = self.statistics.cache_misses.load(Ordering::Relaxed);
         let accesses = cache_hits.saturating_add(cache_misses);
         Stats {
-            bloom_filter_block_reads_avoided: self.statistics.bloom_filter_block_reads_avoided.load(Ordering::Relaxed),
+            bloom_filter_block_reads_avoided: self
+                .statistics
+                .bloom_filter_block_reads_avoided
+                .load(Ordering::Relaxed),
             logical_bytes_written: logical,
             bytes_written_per_level: levels,
-            write_amplification: if logical == 0 { 0.0 } else { written as f64 / logical as f64 },
+            write_amplification: if logical == 0 {
+                0.0
+            } else {
+                written as f64 / logical as f64
+            },
             wal_group_commits: self.statistics.wal_group_commits.load(Ordering::Relaxed),
-            committed_write_requests: self.statistics.committed_write_requests.load(Ordering::Relaxed),
+            committed_write_requests: self
+                .statistics
+                .committed_write_requests
+                .load(Ordering::Relaxed),
             files_per_level,
             live_bytes_per_level,
             cache_hits,
             cache_misses,
-            cache_hit_rate: if accesses == 0 { 0.0 } else { cache_hits as f64 / accesses as f64 },
+            cache_hit_rate: if accesses == 0 {
+                0.0
+            } else {
+                cache_hits as f64 / accesses as f64
+            },
         }
     }
 
@@ -864,16 +1158,23 @@ impl Db {
         }
         let version = manifest::verify(dir, fs.as_ref())?;
         let cache = Arc::new(BlockCache::new(&options));
-        let mut report = VerifyReport { manifest_files: 1, ..VerifyReport::default() };
+        let mut report = VerifyReport {
+            manifest_files: 1,
+            ..VerifyReport::default()
+        };
         let mut verified = BTreeSet::new();
         for path in fs.read_dir(dir)? {
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
             if name == "WAL" || numbered(name, "WAL-", "").is_some() {
                 let mut file = fs.open(&path, FileOptions::new().read(true))?;
                 let length = file.len()?;
                 let mut reader = WalReader::new(file.as_mut());
                 while reader.next_batch()?.is_some() {}
-                if reader.valid_bytes() != length { return Err(Error::Corruption("invalid WAL checksum or torn record")); }
+                if reader.valid_bytes() != length {
+                    return Err(Error::Corruption("invalid WAL checksum or torn record"));
+                }
                 report.wal_files += 1;
             } else if name.starts_with("SST-") && name.ends_with(".sst") {
                 SstableReader::open(&path, Arc::clone(&cache))?;
@@ -884,7 +1185,9 @@ impl Db {
         for &(_, number) in &version.files {
             let path = flush::table_path(dir, number);
             if !verified.contains(&path) {
-                if !fs.exists(&path)? { return Err(Error::Corruption("manifest references missing SSTable")); }
+                if !fs.exists(&path)? {
+                    return Err(Error::Corruption("manifest references missing SSTable"));
+                }
                 SstableReader::open(&path, Arc::clone(&cache))?;
                 report.sstable_files += 1;
             }
@@ -914,11 +1217,16 @@ impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
         let mut state = match self.db.state.lock() {
             Ok(state) => state,
-            Err(error) => { eprintln!("database mutex poisoned while releasing snapshot"); error.into_inner() }
+            Err(error) => {
+                eprintln!("database mutex poisoned while releasing snapshot");
+                error.into_inner()
+            }
         };
         if let Some(count) = state.snapshots.get_mut(&self.sequence) {
             *count -= 1;
-            if *count == 0 { state.snapshots.remove(&self.sequence); }
+            if *count == 0 {
+                state.snapshots.remove(&self.sequence);
+            }
         }
     }
 }
@@ -934,9 +1242,15 @@ impl Drop for Db {
         };
         state.closing = true;
         while state.pending.is_some() {
-            state = match self.maintenance_cv.wait_timeout(state, Duration::from_millis(5)) {
+            state = match self
+                .maintenance_cv
+                .wait_timeout(state, Duration::from_millis(5))
+            {
                 Ok((state, _)) => state,
-                Err(error) => { eprintln!("database mutex poisoned while closing"); error.into_inner().0 }
+                Err(error) => {
+                    eprintln!("database mutex poisoned while closing");
+                    error.into_inner().0
+                }
             };
         }
         if state.notify.send(MaintenanceSignal::Stop).is_err() {
@@ -944,20 +1258,31 @@ impl Drop for Db {
         }
         drop(state);
         if let Some(handle) = self.coordinator.take() {
-            if handle.join().is_err() { eprintln!("maintenance thread panicked"); }
+            if handle.join().is_err() {
+                eprintln!("maintenance thread panicked");
+            }
         }
     }
 }
 
 fn numbered(name: &str, prefix: &str, suffix: &str) -> Option<u64> {
     let digits = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     digits.parse().ok()
 }
 
 fn batch_size(batch: &WriteBatch) -> Result<usize, Error> {
-    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "write batch exceeds WAL record limit");
-    if u32::try_from(batch.mutations.len()).is_err() { return Err(invalid().into()); }
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write batch exceeds WAL record limit",
+        )
+    };
+    if u32::try_from(batch.mutations.len()).is_err() {
+        return Err(invalid().into());
+    }
     let mut size = 0usize;
     for mutation in &batch.mutations {
         let (key, value_len) = match mutation {
@@ -967,10 +1292,15 @@ fn batch_size(batch: &WriteBatch) -> Result<usize, Error> {
         if u32::try_from(key.len()).is_err() || u32::try_from(value_len).is_err() {
             return Err(invalid().into());
         }
-        size = size.checked_add(17).and_then(|n| n.checked_add(key.len()))
-            .and_then(|n| n.checked_add(value_len)).ok_or_else(invalid)?;
+        size = size
+            .checked_add(17)
+            .and_then(|n| n.checked_add(key.len()))
+            .and_then(|n| n.checked_add(value_len))
+            .ok_or_else(invalid)?;
     }
-    if size > wal::MAX_PAYLOAD - 4 { return Err(invalid().into()); }
+    if size > wal::MAX_PAYLOAD - 4 {
+        return Err(invalid().into());
+    }
     Ok(size)
 }
 
@@ -983,22 +1313,29 @@ fn recover(
     let mut paths = Vec::new();
     let mut max_number = version.next_file - 1;
     for path in fs.read_dir(dir)? {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
         if name == "WAL" {
             paths.push((0, path));
         } else if let Some(number) = numbered(name, "WAL-", "") {
-            if number == 0 { return Err(Error::Corruption("invalid WAL number")); }
+            if number == 0 {
+                return Err(Error::Corruption("invalid WAL number"));
+            }
             max_number = max_number.max(number);
             paths.push((number, path));
-        } else if let Some(number) = numbered(name, "SST-", ".sst")
-            .or_else(|| numbered(name, "SST-", ".tmp")) {
+        } else if let Some(number) =
+            numbered(name, "SST-", ".sst").or_else(|| numbered(name, "SST-", ".tmp"))
+        {
             max_number = max_number.max(number);
         }
     }
     paths.sort_by_key(|(number, _)| *number);
     let mut next_file = max_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
     if paths.is_empty() {
-        let path = if version.last_sequence == 0 { dir.join("WAL") } else {
+        let path = if version.last_sequence == 0 {
+            dir.join("WAL")
+        } else {
             let path = flush::wal_path(dir, next_file);
             next_file = next_file.checked_add(1).ok_or(Error::SequenceExhausted)?;
             path
@@ -1009,7 +1346,10 @@ fn recover(
         paths.push((0, path));
     }
     let mut table = BTreeMemtable::default();
-    let mut next_sequence = version.last_sequence.checked_add(1).ok_or(Error::SequenceExhausted)?;
+    let mut next_sequence = version
+        .last_sequence
+        .checked_add(1)
+        .ok_or(Error::SequenceExhausted)?;
     for (_, path) in &paths {
         let mut file = fs.open(path, FileOptions::new().read(true).write(true))?;
         let mut reader = WalReader::new(file.as_mut());
@@ -1018,18 +1358,28 @@ fn recover(
             let mut older = None;
             for operation in batch {
                 let sequence = match &operation {
-                    Operation::Put { sequence, .. } | Operation::Delete { sequence, .. } => *sequence,
+                    Operation::Put { sequence, .. } | Operation::Delete { sequence, .. } => {
+                        *sequence
+                    }
                 };
-                if sequence == 0 || previous.is_some_and(|last: u64| last.checked_add(1) != Some(sequence)) {
+                if sequence == 0
+                    || previous.is_some_and(|last: u64| last.checked_add(1) != Some(sequence))
+                {
                     return Err(Error::InvalidSequence);
                 }
                 let flushed = sequence <= version.last_sequence;
-                if older.is_some_and(|old| old != flushed) { return Err(Error::InvalidSequence); }
+                if older.is_some_and(|old| old != flushed) {
+                    return Err(Error::InvalidSequence);
+                }
                 older = Some(flushed);
                 previous = Some(sequence);
                 if !flushed {
-                    if sequence != next_sequence { return Err(Error::InvalidSequence); }
-                    next_sequence = next_sequence.checked_add(1).ok_or(Error::SequenceExhausted)?;
+                    if sequence != next_sequence {
+                        return Err(Error::InvalidSequence);
+                    }
+                    next_sequence = next_sequence
+                        .checked_add(1)
+                        .ok_or(Error::SequenceExhausted)?;
                     apply(&mut table, operation);
                 }
             }
@@ -1051,7 +1401,11 @@ fn recover(
 
 fn apply(table: &mut BTreeMemtable, operation: Operation) {
     match operation {
-        Operation::Put { sequence, key, value } => {
+        Operation::Put {
+            sequence,
+            key,
+            value,
+        } => {
             table.insert(InternalKey::new(key, sequence, Kind::Put), value);
         }
         Operation::Delete { sequence, key } => {

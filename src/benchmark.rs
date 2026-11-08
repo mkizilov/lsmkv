@@ -26,7 +26,13 @@ pub enum Workload {
 }
 
 impl Workload {
-    pub const ALL: [Self; 5] = [Self::SequentialWrite, Self::RandomWrite, Self::ReadHit, Self::ReadMiss, Self::Scan100];
+    pub const ALL: [Self; 5] = [
+        Self::SequentialWrite,
+        Self::RandomWrite,
+        Self::ReadHit,
+        Self::ReadMiss,
+        Self::Scan100,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -42,8 +48,12 @@ impl Workload {
 impl FromStr for Workload {
     type Err = io::Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL.into_iter().find(|workload| workload.name() == value)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unknown benchmark workload"))
+        Self::ALL
+            .into_iter()
+            .find(|workload| workload.name() == value)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unknown benchmark workload")
+            })
     }
 }
 
@@ -54,21 +64,31 @@ impl OwnedDir {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".agent-local/benchmarks");
         fs::create_dir_all(&root)?;
         for _ in 0..1000 {
-            let path = root.join(format!("run-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let path = root.join(format!(
+                "run-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             match fs::create_dir(&path) {
                 Ok(()) => return Ok(Self(path)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
         }
-        Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate benchmark directory"))
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate benchmark directory",
+        ))
     }
 }
 
 impl Drop for OwnedDir {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
-            eprintln!("failed to remove benchmark directory {}: {error}", self.0.display());
+            eprintln!(
+                "failed to remove benchmark directory {}: {error}",
+                self.0.display()
+            );
         }
     }
 }
@@ -83,7 +103,11 @@ pub struct Dataset {
 impl Dataset {
     pub fn new(keys: u64) -> BenchResult<Self> {
         if !(100..=u64::MAX / 2).contains(&keys) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "key count must be at least 100 and at most half of u64::MAX").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "key count must be at least 100 and at most half of u64::MAX",
+            )
+            .into());
         }
         let dir = OwnedDir::new()?;
         let db = Db::open(&dir.0, Options::default())?;
@@ -91,16 +115,26 @@ impl Dataset {
         while first < keys {
             let end = first.saturating_add(1000).min(keys);
             let mut batch = WriteBatch::new();
-            for number in first..end { batch.put((number * 2).to_be_bytes(), VALUE); }
+            for number in first..end {
+                batch.put((number * 2).to_be_bytes(), VALUE);
+            }
             db.write(batch)?;
             first = end;
         }
         db.sync()?;
-        Ok(Self { db, _dir: dir, keys })
+        Ok(Self {
+            db,
+            _dir: dir,
+            keys,
+        })
     }
 
-    pub fn db(&self) -> &Db { &self.db }
-    pub fn keys(&self) -> u64 { self.keys }
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+    pub fn keys(&self) -> u64 {
+        self.keys
+    }
 }
 
 fn random_index(sequence: u64, keys: u64) -> u64 {
@@ -112,7 +146,7 @@ fn random_index(sequence: u64, keys: u64) -> u64 {
 
 /// Execute one operation and check the returned data.
 pub fn step(db: &Db, keys: u64, workload: Workload, sequence: u64) -> BenchResult<()> {
-    if keys < 100 || keys > u64::MAX / 2 {
+    if !(100..=u64::MAX / 2).contains(&keys) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid key count").into());
     }
     let random = random_index(sequence, keys);
@@ -131,10 +165,15 @@ pub fn step(db: &Db, keys: u64, workload: Workload, sequence: u64) -> BenchResul
         }
         Workload::Scan100 => {
             let start = random_index(sequence, keys - 99);
-            let entries = db.scan((start * 2).to_be_bytes().to_vec()..((start + 100) * 2).to_be_bytes().to_vec())?;
-            if entries.len() != 100 || entries.iter().enumerate().any(|(offset, (key, value))| {
-                key.as_slice() != ((start + offset as u64) * 2).to_be_bytes().as_slice() || value.as_slice() != &VALUE[..]
-            }) {
+            let entries = db.scan(
+                (start * 2).to_be_bytes().to_vec()..((start + 100) * 2).to_be_bytes().to_vec(),
+            )?;
+            if entries.len() != 100
+                || entries.iter().enumerate().any(|(offset, (key, value))| {
+                    key.as_slice() != ((start + offset as u64) * 2).to_be_bytes().as_slice()
+                        || value.as_slice() != &VALUE[..]
+                })
+            {
                 return Err(io::Error::other("benchmark scan returned unexpected data").into());
             }
         }
@@ -143,14 +182,26 @@ pub fn step(db: &Db, keys: u64, workload: Workload, sequence: u64) -> BenchResul
 }
 
 /// Run one workload for a duration, including the final durability barrier.
-pub fn run_for(dataset: &Dataset, workload: Workload, duration: Duration) -> BenchResult<(u64, Duration)> {
-    if duration.is_zero() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "duration must be positive").into()); }
+pub fn run_for(
+    dataset: &Dataset,
+    workload: Workload,
+    duration: Duration,
+) -> BenchResult<(u64, Duration)> {
+    if duration.is_zero() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "duration must be positive").into(),
+        );
+    }
     let started = Instant::now();
-    let deadline = started.checked_add(duration).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "duration too large"))?;
+    let deadline = started
+        .checked_add(duration)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "duration too large"))?;
     let mut operations = 0u64;
     while Instant::now() < deadline {
         step(dataset.db(), dataset.keys(), workload, operations)?;
-        operations = operations.checked_add(1).ok_or_else(|| io::Error::other("operation count overflow"))?;
+        operations = operations
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("operation count overflow"))?;
     }
     dataset.db().sync()?;
     Ok((operations, started.elapsed()))
@@ -177,7 +228,9 @@ mod tests {
     fn every_workload_runs_on_a_small_dataset() {
         let dataset = Dataset::new(120).unwrap();
         for workload in Workload::ALL {
-            for sequence in 0..4 { step(dataset.db(), dataset.keys(), workload, sequence).unwrap(); }
+            for sequence in 0..4 {
+                step(dataset.db(), dataset.keys(), workload, sequence).unwrap();
+            }
         }
     }
 }

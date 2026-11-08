@@ -5,28 +5,33 @@ feature appeal. Estimates are engineering hours for one Rust engineer familiar
 with storage systems, with project-local dependency access restored. They include
 implementation, review, and ordinary verification, but exclude waiting for
 network access, CI capacity, privileged profiling permission, or hardware. Steps
-may overlap only where their dependencies permit it. **Total: approximately
-260–528 hours.** The range is not a delivery commitment; failures uncovered by
-the currently unrun suites may require additional work.
+may overlap only where their dependencies permit it. The original full plan was
+**260–528 hours**. Steps 1–2 are now complete; subtracting their original
+estimates leaves an indicative **236–472 hours** for the remaining steps, before
+adjusting for partial progress. This is not a delivery commitment.
 
 ## Current implementation and evidence
 
 | Area | Status at handoff |
 | --- | --- |
-| Stable crate, CLI, WAL, memtable, SSTables, manifest, snapshots, compaction, cache, filters, filesystem abstraction | **Implemented in source; unverified:** no Rust compiler or Cargo was available to build or execute them. |
-| Property, fault-injection, 200-iteration crash, and 8-writer/8-reader concurrency suites | **Implemented as tests; unverified:** none ran here. No property-discovered failures or successful crash iterations are claimed. |
-| Three bounded fuzz targets | **Implemented; unverified:** zero fuzzing minutes were run; there are no fuzz-discovered or minimized crash fixtures. |
+| Stable crate, CLI, WAL, memtable, SSTables, manifest, snapshots, compaction, cache, filters, filesystem abstraction | **Implemented and checked:** stable all-target `cargo check` and release build, strict Clippy, and the full test suite passed on 2026-11-08; tests do not prove production durability. |
+| Property, fault-injection, 200-iteration crash, and 8-writer/8-reader concurrency suites | **Verified:** property and fault tests, 200 crash iterations, and debug/release concurrency stress passed. |
+| Three bounded fuzz targets | **Partially verified:** all three targets built, but a five-second WAL smoke run hung until the 180-second cap; full-duration targets remain unverified and no fuzz crash fixtures are claimed. |
 | Million-key Criterion and CLI benchmarks | **Partially implemented:** workloads and machine specifications are documented, but no performance results, slowest workload, profile, or measured optimization exist. |
-| CLI checksum verification, statistics, source review | **Implemented/source-reviewed; unverified:** `README.md` and `TODO.md` describe behavior and remaining risks. |
+| CLI checksum verification, statistics, source review | **Implemented and tested:** CLI, integrity, statistics, and recovery integration tests passed; `TODO.md` records remaining review risks. |
 | Shell and repository inspection | **Verified here:** shell syntax and Git whitespace checks passed; targeted scans of tracked files found no matches for four common credential signatures or common cache/scratch paths. These scans are not a complete security audit. |
 
-The most recent project-local toolchain download attempt failed to resolve
-`static.rust-lang.org`. `scripts/check.sh`, Rust diagnostics, and all tests remain
-unverified. There is no root or fuzz `Cargo.lock` yet. No hardware or Docker
+DNS access was restored on 2026-11-08; pinned stable and fuzz toolchains and
+cargo-fuzz were installed locally. `scripts/check.sh` passed with 77 tests, and
+both debug and release concurrency stress passed. Root and fuzz lockfiles were
+generated for reproducibility. No hardware or Docker
 integration is required by the current implementation; no such check has been
 performed, and host services and hardware remain outside the repository boundary.
 
 ## 1. Restore the project-local Rust toolchain
+
+**Status: complete on 2026-11-08.** Stable 1.85.1 with rustfmt and Clippy,
+nightly-2025-03-18, and cargo-fuzz 0.12.0 are installed project-locally.
 
 - **Scope:** Install the pinned stable toolchain and components inside the
   repository; install the pinned nightly and cargo-fuzz locally when needed.
@@ -39,10 +44,14 @@ performed, and host services and hardware remain outside the repository boundary
 
 ## 2. Establish a passing build and verification baseline
 
+**Status: complete on 2026-11-08.** `cargo check --all-targets`, an all-target
+release build, strict Clippy, and `RUST_TEST_THREADS=2 scripts/check.sh` passed
+using the existing macOS SDK read-only; the latter reported 77 passing tests.
+
 - **Scope:** Resolve dependencies locally, run format, Clippy, unit/integration
   tests, and fix every actual compile, formatting, lint, or test failure.
-- **Rationale:** All prior Rust implementation and even basic buildability are
-  unverified; this is the prerequisite for trustworthy downstream work.
+- **Rationale:** A passing baseline is the prerequisite for trustworthy
+  downstream work and must be preserved as changes are made.
 - **Dependencies:** Step 1.
 - **Acceptance:** `RUST_TEST_THREADS=2 scripts/check.sh` passes from a clean
   checkout; any corrections have regression tests and no weakened assertions.
@@ -53,8 +62,8 @@ performed, and host services and hardware remain outside the repository boundary
 - **Scope:** Run the existing 10-second eight-writer/eight-reader stress suite in
   debug and release, exercise atomic batches, leader handoff, stalls, and
   coordinator/leader failure and shutdown paths.
-- **Rationale:** Concurrency and group commit are implemented but untested;
-  coordinator or leader panic can strand waiters or hang shutdown.
+- **Rationale:** The debug and release stress suites passed; coordinator or
+  leader panic can still strand waiters or hang shutdown.
 - **Dependencies:** Steps 1–2.
 - **Acceptance:** Both specified stress runs complete without mismatches,
   deadlocks, or panics; deterministic failure-injection tests prove waiters are
@@ -65,8 +74,8 @@ performed, and host services and hardware remain outside the repository boundary
 
 - **Scope:** Run all 200 SIGKILL iterations and injected write, torn-write,
   truncate, fsync, manifest, and SSTable failures; investigate every failure.
-- **Rationale:** Recovery code and its harness exist, but no crash iteration or
-  fault case has executed in this environment.
+- **Rationale:** The full harness and fault suite passed once; broader crash
+  boundaries and repeated platform coverage remain worthwhile.
 - **Dependencies:** Steps 1–2.
 - **Acceptance:** The full harness passes with actual iteration counts recorded;
   acknowledged data survives, unacknowledged data remains a valid prefix, and
@@ -91,8 +100,8 @@ performed, and host services and hardware remain outside the repository boundary
 - **Scope:** Exercise offline verification against corrupted manifests, WALs,
   indexes, data/filter blocks, footers, missing live tables, and orphan files;
   assess footer checksum/versioning and dependency risks.
-- **Rationale:** The CLI verifier and checksums are source-implemented but
-  untested; the footer lacks a checksum and recognized-file coverage is limited.
+- **Rationale:** CLI integrity tests passed; the footer lacks a checksum and
+  recognized-file coverage and dependency review remain limited.
 - **Dependencies:** Steps 2, 4, and 5.
 - **Acceptance:** Corruptions are detected without altering evidence; coverage
   and excluded file types are explicit; dependency and unsafe-code review results
@@ -114,8 +123,8 @@ performed, and host services and hardware remain outside the repository boundary
 
 - **Scope:** Run each existing WAL, SSTable, and manifest target for at least
   600 seconds, expand coverage where necessary, and minimize all crashes.
-- **Rationale:** Targets exist but were never executed; only an allocation issue
-  found by inspection has a regression test.
+- **Rationale:** All targets built, but the bounded WAL smoke run hung before
+  producing libFuzzer output; the required runs have not completed.
 - **Dependencies:** Steps 1–2 and integrity fixes from steps 5–6.
 - **Acceptance:** Actual durations and outcomes are recorded; each failure is
   fixed and its minimized input is retained in a normal regression test.
@@ -181,7 +190,8 @@ performed, and host services and hardware remain outside the repository boundary
 
 - **Scope:** Generate and retain appropriate lockfiles, pin local tool installs,
   and add project-contained CI for formatting, Clippy, tests, and fuzz smoke runs.
-- **Rationale:** Lockfiles are currently absent and no Rust gate has run here.
+- **Rationale:** Lockfiles and a local Rust baseline now exist; automated clean
+  checkout and CI verification are still needed.
 - **Dependencies:** Steps 1–2.
 - **Acceptance:** A clean checkout builds with documented pinned tools and
   lockfiles; CI runs the same checks without host credentials or global installs.

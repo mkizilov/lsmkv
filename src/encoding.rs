@@ -76,7 +76,11 @@ mod tests {
             assert_eq!(get_varint(&mut input), Some(value));
             assert!(input.is_empty());
         }
-        for bytes in [&[0x80][..], &[0x80, 0][..], &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2][..]] {
+        for bytes in [
+            &[0x80][..],
+            &[0x80, 0][..],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2][..],
+        ] {
             let mut input = bytes;
             assert_eq!(get_varint(&mut input), None);
             assert_eq!(input, bytes);

@@ -91,12 +91,10 @@ little-endian except user-supplied bytes. See `DESIGN.md` for exact layouts.
   materialize their result in memory. Compaction is whole-level rather than
   overlap-minimal; orphan cleanup and an error-returning database close remain
   future work. See `TODO.md` for review findings.
-- This implementation, its crash harness and fuzzers have not been validated in
-  the current sandbox because Cargo is unavailable. Do not treat it as a
-  production durability guarantee until the full checks have passed.
-- Neither the property and concurrency tests nor the 200-iteration crash test
-  have run here. The fuzz targets ran for zero minutes, and the million-key
-  workloads have no measured results or verified optimization.
+- The stable check suite, all-target release build, property tests, fault tests,
+  200-iteration crash test, and debug/release concurrency tests passed locally on
+  2026-11-08. This is not a production durability guarantee. Fuzzing and the
+  million-key benchmarks remain incomplete; see `FUZZING.md` and `BENCHMARKS.md`.
 
 ## Verification and performance
 
@@ -118,3 +116,11 @@ bounded runs, and regression procedures are in `FUZZING.md`; benchmark setup,
 machine details, and the absence of measured results are in `BENCHMARKS.md`.
 The prioritized handoff, verification gaps, and effort estimates are in
 `ROADMAP.md`.
+
+On the verification host, the existing macOS Command Line Tools SDK was used
+read-only by setting `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`;
+all Rust installations, caches and temporary files remained project-local.
+
+## License
+
+MIT; see `LICENSE`. Third-party dependencies retain their own licenses.

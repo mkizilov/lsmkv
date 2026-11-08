@@ -5,7 +5,9 @@ use crate::Error;
 const MAX_INPUT: usize = 65_536;
 
 fn bounded(bytes: &[u8]) -> Result<(), Error> {
-    if bytes.len() > MAX_INPUT { return Err(Error::Corruption("fuzz input exceeds limit")); }
+    if bytes.len() > MAX_INPUT {
+        return Err(Error::Corruption("fuzz input exceeds limit"));
+    }
     Ok(())
 }
 

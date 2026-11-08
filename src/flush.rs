@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::manifest::{self, Edit};
 use crate::fs::{FileOptions, FsFile};
+use crate::manifest::{self, Edit};
 use crate::memtable::BTreeMemtable;
 use crate::sstable::{BlockCache, SstableReader, SstableWriter};
 use crate::{Error, Options};
@@ -39,13 +39,20 @@ pub fn run(job: FlushJob) -> Result<Output, Error> {
     let result = write_and_publish(job, file, &temporary, &final_path);
     if result.is_err() {
         if let Err(error) = fs.remove_file(&temporary) {
-            if error.kind() != std::io::ErrorKind::NotFound { eprintln!("failed to remove incomplete SSTable: {error}"); }
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("failed to remove incomplete SSTable: {error}");
+            }
         }
     }
     result
 }
 
-fn write_and_publish(job: FlushJob, file: Box<dyn FsFile>, temporary: &Path, final_path: &Path) -> Result<Output, Error> {
+fn write_and_publish(
+    job: FlushJob,
+    file: Box<dyn FsFile>,
+    temporary: &Path,
+    final_path: &Path,
+) -> Result<Output, Error> {
     let mut writer = SstableWriter::with_options(file, &job.options)?;
     for (key, value) in job.table.entries() {
         writer.add(key, value)?;
@@ -57,13 +64,19 @@ fn write_and_publish(job: FlushJob, file: Box<dyn FsFile>, temporary: &Path, fin
     job.options.fs.rename(temporary, final_path)?;
     manifest::sync_dir(&job.dir, job.options.fs.as_ref())?;
     let reader = SstableReader::open(final_path, job.cache)?;
-    manifest::append(&job.dir, &Edit {
-        added: vec![(0, job.table_number)],
-        removed: Vec::new(),
-        next_file: job.next_file,
-        last_sequence: job.last_sequence,
-    }, job.options.fs.as_ref())?;
-    for path in job.wal_paths { job.options.fs.remove_file(&path)?; }
+    manifest::append(
+        &job.dir,
+        &Edit {
+            added: vec![(0, job.table_number)],
+            removed: Vec::new(),
+            next_file: job.next_file,
+            last_sequence: job.last_sequence,
+        },
+        job.options.fs.as_ref(),
+    )?;
+    for path in job.wal_paths {
+        job.options.fs.remove_file(&path)?;
+    }
     manifest::sync_dir(&job.dir, job.options.fs.as_ref())?;
     Ok(Output { reader, size })
 }
