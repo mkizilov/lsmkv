@@ -212,9 +212,15 @@ impl Background {
 
 impl State {
     fn schedule_compaction(&mut self) -> Result<bool, Error> {
+        self.schedule_compaction_mode(false)
+    }
+
+    fn schedule_compaction_mode(&mut self, force: bool) -> Result<bool, Error> {
         if self.pending.is_some() || self.rotating || self.write_failed { return Ok(false); }
         let mut chosen = None;
-        if self.tables.get(&0).map_or(0, Vec::len) > self.options.l0_compaction_trigger {
+        if force {
+            chosen = self.tables.iter().find(|(_, files)| !files.is_empty()).map(|(&level, _)| level);
+        } else if self.tables.get(&0).map_or(0, Vec::len) > self.options.l0_compaction_trigger {
             chosen = Some(0);
         } else {
             for (&level, files) in self.tables.iter() {
@@ -338,10 +344,12 @@ pub struct Db {
 }
 
 struct WriteRequest {
-    batch: WriteBatch,
+    work: WriteWork,
     size: usize,
     reply: Sender<WriteResponse>,
 }
+
+enum WriteWork { Batch(WriteBatch), Flush, Compact }
 
 enum WriteResponse { Lead, Complete(Result<(), Error>) }
 
@@ -459,10 +467,24 @@ impl Db {
     pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
         if batch.mutations.is_empty() { return Ok(()); }
         let size = batch_size(&batch)?;
+        self.enqueue(WriteWork::Batch(batch), size)
+    }
+
+    /// Flush the current memtable and wait for publication.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.enqueue(WriteWork::Flush, 0)
+    }
+
+    /// Flush the current memtable and perform one compaction if tables exist.
+    pub fn compact(&self) -> Result<(), Error> {
+        self.enqueue(WriteWork::Compact, 0)
+    }
+
+    fn enqueue(&self, work: WriteWork, size: usize) -> Result<(), Error> {
         let (reply, receiver) = mpsc::channel();
         let leader = {
             let mut queue = self.write_queue.lock().map_err(|_| Error::Poisoned)?;
-            queue.pending.push_back(WriteRequest { batch, size, reply });
+            queue.pending.push_back(WriteRequest { work, size, reply });
             self.write_cv.notify_one();
             if queue.leader { false } else { queue.leader = true; true }
         };
@@ -486,35 +508,51 @@ impl Db {
                 }
             };
             if queue.pending.is_empty() { queue.leader = false; return; }
-            if queue.pending.len() == 1 {
+            if queue.pending.len() == 1 && queue.pending.front().is_some_and(|next| matches!(&next.work, WriteWork::Batch(_))) {
                 queue = match self.write_cv.wait_timeout(queue, Duration::from_millis(1)) {
                     Ok((queue, _)) => queue,
                     Err(error) => error.into_inner().0,
                 };
             }
-            let mut size = 4usize;
-            let mut group = Vec::new();
-            let mut operation_count = 0usize;
-            while group.len() < 256 {
-                let Some(next) = queue.pending.front() else { break };
-                if size + next.size > wal::MAX_PAYLOAD
-                    || operation_count + next.batch.mutations.len() > u32::MAX as usize { break; }
-                size += next.size;
-                operation_count += next.batch.mutations.len();
-                if let Some(request) = queue.pending.pop_front() { group.push(request); }
-            }
-            drop(queue);
+            let Some(first) = queue.pending.pop_front() else { queue.leader = false; return; };
+            let WriteRequest { work, size: first_size, reply } = first;
+            let mut replies = vec![reply];
             let mut combined = WriteBatch::new();
-            let mut replies = Vec::new();
-            for request in group {
-                combined.mutations.extend(request.batch.mutations);
-                replies.push(request.reply);
-            }
+            let is_batch = matches!(&work, WriteWork::Batch(_));
+            let work = match work {
+                WriteWork::Batch(batch) => {
+                    combined.mutations.extend(batch.mutations);
+                    let mut size = 4 + first_size;
+                    while replies.len() < 256 {
+                        let Some(next) = queue.pending.front() else { break };
+                        let WriteWork::Batch(batch) = &next.work else { break };
+                        if size + next.size > wal::MAX_PAYLOAD
+                            || combined.mutations.len() + batch.mutations.len() > u32::MAX as usize { break; }
+                        size += next.size;
+                        if let Some(request) = queue.pending.pop_front() {
+                            if let WriteWork::Batch(batch) = request.work {
+                                combined.mutations.extend(batch.mutations);
+                                replies.push(request.reply);
+                            }
+                        }
+                    }
+                    WriteWork::Batch(combined)
+                }
+                other => other,
+            };
+            drop(queue);
             let count = replies.len() as u64;
-            match self.commit_group(combined) {
+            let result = match work {
+                WriteWork::Batch(batch) => self.commit_group(batch),
+                WriteWork::Flush => self.force_maintenance(false),
+                WriteWork::Compact => self.force_maintenance(true),
+            };
+            match result {
                 Ok(()) => {
-                    self.statistics.wal_group_commits.fetch_add(1, Ordering::Relaxed);
-                    self.statistics.committed_write_requests.fetch_add(count, Ordering::Relaxed);
+                    if is_batch {
+                        self.statistics.wal_group_commits.fetch_add(1, Ordering::Relaxed);
+                        self.statistics.committed_write_requests.fetch_add(count, Ordering::Relaxed);
+                    }
                     for reply in replies { let _ = reply.send(WriteResponse::Complete(Ok(()))); }
                 }
                 Err(error) => {
@@ -534,6 +572,21 @@ impl Db {
                 queue.pending.pop_front();
             }
             queue.leader = false;
+    }
+
+    fn force_maintenance(&self, compact: bool) -> Result<(), Error> {
+        let state = self.wait_maintenance(self.state()?)?;
+        if state.table.approximate_memory_usage() > 0 {
+            self.rotate_and_flush(state)?;
+        } else {
+            drop(state);
+        }
+        let mut state = self.wait_maintenance(self.state()?)?;
+        if compact && state.schedule_compaction_mode(true)? {
+            state = self.wait_maintenance(state)?;
+        }
+        drop(state);
+        Ok(())
     }
 
     fn wait_maintenance<'a>(&self, mut state: MutexGuard<'a, State>) -> Result<MutexGuard<'a, State>, Error> {

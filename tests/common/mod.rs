@@ -5,7 +5,7 @@ use std::path::Path;
 use lsmkv::{Entry, Error, Options};
 
 /// Simple current-state reference for database integration tests.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ModelDb {
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
 }

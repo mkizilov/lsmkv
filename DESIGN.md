@@ -45,6 +45,11 @@ under the mutex; obsolete file deletion occurs after it is released. `stats()`
 reports `wal_group_commits` and `committed_write_requests` for process-lifetime
 group-commit observation.
 
+`flush()` and `compact()` are FIFO barriers in the same writer queue. `flush()`
+publishes the current nonempty memtable; `compact()` first flushes, then forces
+one eligible level into its successor and waits for resulting maintenance.
+Either is a no-op when there is no corresponding work.
+
 When a batch takes the mutable memtable over `Options::memtable_size` (default
 4 MiB), the database syncs its old WAL, creates and syncs a new numbered WAL,
 then freezes the old memtable and flushes it on a background thread. At most one
@@ -250,3 +255,12 @@ within each level. Compaction retains versions and tombstones needed for reads
 and must not discard a tombstone while an older value could remain in a lower
 level. It atomically publishes its live-file changes through the manifest before
 deleting inputs.
+
+## Bugs found by property tests
+
+The model-based property suite has not yet been run in this environment: the
+project-local Rust toolchain could not be installed because the download host did
+not resolve. No property-test-discovered bugs or failing seeds have been claimed.
+`tests/property.rs` stores future failing seeds in
+`proptest-regressions/property.txt`; check them in and keep them when fixing a
+failure. Run it with `cargo test --test property` in addition to `scripts/check.sh`.

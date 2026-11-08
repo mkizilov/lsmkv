@@ -1,0 +1,1 @@
+# Proptest regression seeds for tests/property.rs are saved here when failures occur.
