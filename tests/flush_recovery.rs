@@ -28,7 +28,7 @@ impl Drop for TestDir {
 #[test]
 fn several_flushes_preserve_overwrites_deletes_and_recovery() {
     let dir = TestDir::new();
-    let options = Options { memtable_size: 320, ..Options::default() };
+    let options = Options { memtable_size: 320, l0_compaction_trigger: 10_000, l0_stop_writes_trigger: 10_001, ..Options::default() };
     let mut expected = BTreeMap::new();
     {
         let db = Db::open(&dir.0, options.clone()).unwrap();

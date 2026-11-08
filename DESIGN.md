@@ -1,8 +1,8 @@
 # lsmkv design
 
 Keys and values are arbitrary bytes, ordered lexicographically. The current
-`Db` uses a WAL, B-tree memtables, and manifest-tracked SSTables. It writes
-level 0 and reads deeper levels; compaction remains future work.
+`Db` uses a WAL, B-tree memtables, and manifest-tracked SSTables. It flushes to
+level 0 and compacts into successively deeper non-overlapping levels.
 
 `Db::open` holds an exclusive OS advisory lock on the persistent `LOCK` file for
 the handle's lifetime. It loads the manifest and its SSTables, then replays WAL
@@ -17,9 +17,9 @@ After a WAL append error, further writes require reopening: a failed write may
 still have reached disk and can appear after recovery. Scans return current live
 keys in sorted order. `snapshot()` pins the current sequence; its `get` and
 `scan` filter out later writes even across subsequent flushes. Snapshots borrow
-the database and cannot outlive it. All versions are currently retained, so no
-separate pin registry is needed; future compaction must preserve versions needed
-by active snapshots.
+the database and cannot outlive it. Active snapshot sequences are registered
+until their handles are dropped; compaction preserves the newest version and the
+version visible to each snapshot for every user key.
 
 When a batch takes the mutable memtable over `Options::memtable_size` (default
 4 MiB), the database syncs its old WAL, creates and syncs a new numbered WAL,
@@ -55,8 +55,36 @@ next file number, u64 last flushed sequence, u32 added count, u32 removed count,
 then added and removed entries respectively, each `(level:u32, file:u64)`.
 Complete edits with bad checksums are rejected; a truncated final edit is
 discarded and truncated. File additions/removals are applied in order. This
-implementation creates level-0 files only; manifest-listed deeper levels are
-readable when their user-key ranges do not overlap.
+implementation writes level-0 flushes and compaction outputs into deeper levels;
+manifest-listed deeper levels must have non-overlapping user-key ranges.
+
+### Compaction and versions
+
+One background maintenance job runs at a time, serialized with flushes. Level 0
+is compacted when it has more than `l0_compaction_trigger` files (default 4).
+Level N greater than zero is compacted when its total file size exceeds
+`target_file_size * 10^N`, using saturating arithmetic. This implementation
+merges all files in the chosen level and its successor, so all destination
+overlaps are included. The output is split approximately at `target_file_size`
+(default 2 MiB), only between user keys; a single user key may exceed the target.
+The coordinator continues scheduling eligible levels even without new requests.
+Writes stall at `l0_stop_writes_trigger` (default 12) until level 0 is reduced.
+
+For each user key the merge keeps its newest version and the newest version at
+or below each live snapshot sequence. A tombstone is dropped only when no deeper
+level exists and no retained older Put requires that tombstone to hide it. New
+snapshots acquired while a job is running have sequences at least as new as the
+job's inputs. The job syncs output files and their directory before one manifest
+edit adds outputs and removes inputs. Each reader holds a reference-counted table
+version; removed files are marked obsolete after the manifest edit and unlinked
+only when all references to their table objects have gone away. A failed job
+stops further writes and leaves inputs intact; unpublished output may remain as
+an orphan for future cleanup.
+
+`Db::stats()` reports process-lifetime SSTable bytes written per level, logical
+key/value bytes accepted by WAL writes, and their ratio as write amplification.
+The ratio excludes WAL and manifest bytes, and is zero if no logical bytes have
+been written. Statistics are shared via `Options` and are not persisted.
 
 ## Internal keys and storage
 

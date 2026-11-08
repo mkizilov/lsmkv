@@ -76,3 +76,44 @@ fn overlapping_deeper_level_ranges_are_rejected() {
     manifest::append(&dir.0, &Edit { added: vec![(1, 1), (1, 2)], removed: Vec::new(), next_file: 3, last_sequence: 3 }).unwrap();
     assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Corruption("overlapping table ranges"))));
 }
+
+#[test]
+fn obsolete_files_wait_for_reference_counted_versions() {
+    use std::sync::Arc;
+    let dir = TestDir::new();
+    let options = Options { memtable_size: 1, l0_compaction_trigger: 2, l0_stop_writes_trigger: 3, ..Options::default() };
+    let db = Db::open(&dir.0, options).unwrap();
+    db.put(b"a", b"one").unwrap();
+    db.put(b"b", b"two").unwrap();
+    db.sync().unwrap();
+    let pinned = Arc::clone(&db.state().unwrap().tables);
+    let paths: Vec<_> = pinned.get(&0).unwrap().iter().map(|table| table.path.clone()).collect();
+    assert_eq!(paths.len(), 2);
+    db.put(b"c", b"three").unwrap();
+    db.sync().unwrap();
+    assert!(paths.iter().all(|path| path.exists()));
+    assert_eq!(db.get(b"a").unwrap(), Some(b"one".to_vec()));
+    drop(pinned);
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert!(db.stats().bytes_written_per_level.get(&1).copied().unwrap_or(0) > 0);
+    assert!(db.stats().write_amplification > 0.0);
+}
+
+#[test]
+fn oversized_deeper_levels_are_compacted_and_split() {
+    let dir = TestDir::new();
+    let options = Options { memtable_size: 1, l0_compaction_trigger: 1, l0_stop_writes_trigger: 2, target_file_size: 80, ..Options::default() };
+    let db = Db::open(&dir.0, options).unwrap();
+    for i in 0..20 {
+        db.put(format!("key-{i:02}").into_bytes(), vec![i as u8; 100]).unwrap();
+    }
+    db.sync().unwrap();
+    {
+        let state = db.state().unwrap();
+        assert!(state.tables.iter().any(|(&level, files)| level >= 2 && !files.is_empty()));
+        assert!(state.tables.values().any(|files| files.len() > 1));
+    }
+    for i in 0..20 {
+        assert_eq!(db.get(format!("key-{i:02}").as_bytes()).unwrap(), Some(vec![i as u8; 100]));
+    }
+}

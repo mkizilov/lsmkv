@@ -46,6 +46,7 @@ fn write_and_publish(job: FlushJob, file: std::fs::File, temporary: &Path, final
     }
     let file = writer.finish()?;
     file.sync_all()?;
+    job.options.statistics.record_level(0, file.metadata()?.len())?;
     fs::rename(temporary, final_path)?;
     manifest::sync_dir(&job.dir)?;
     let reader = SstableReader::open(final_path, job.cache)?;

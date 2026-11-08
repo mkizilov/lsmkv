@@ -6,7 +6,9 @@ use std::io;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::ops::Deref;
 use std::thread::{self, JoinHandle};
 
 use fs2::FileExt;
@@ -21,6 +23,7 @@ pub mod wal;
 mod manifest;
 mod flush;
 mod merge;
+mod compaction;
 #[cfg(test)]
 mod read_tests;
 
@@ -52,6 +55,12 @@ pub struct Options {
     pub bloom_bits_per_key: usize,
     /// Approximate mutable memtable size before scheduling a flush.
     pub memtable_size: usize,
+    /// Compact when level 0 contains more than this many files.
+    pub l0_compaction_trigger: usize,
+    /// Stall writes at this many level-0 files until compaction completes.
+    pub l0_stop_writes_trigger: usize,
+    /// Target size of compaction output files and basis for level targets.
+    pub target_file_size: u64,
     /// Counters shared by database and SSTable readers using these options.
     pub statistics: Arc<Statistics>,
 }
@@ -63,6 +72,9 @@ impl Default for Options {
             block_cache_capacity: 8 * 1024 * 1024,
             bloom_bits_per_key: 10,
             memtable_size: 4 * 1024 * 1024,
+            l0_compaction_trigger: 4,
+            l0_stop_writes_trigger: 12,
+            target_file_size: 2 * 1024 * 1024,
             statistics: Arc::new(Statistics::default()),
         }
     }
@@ -72,12 +84,51 @@ impl Default for Options {
 #[derive(Debug, Default)]
 pub struct Statistics {
     bloom_filter_block_reads_avoided: AtomicU64,
+    logical_bytes_written: AtomicU64,
+    bytes_written_per_level: Mutex<BTreeMap<u32, u64>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stats {
     pub bloom_filter_block_reads_avoided: u64,
+    pub logical_bytes_written: u64,
+    pub bytes_written_per_level: BTreeMap<u32, u64>,
+    pub write_amplification: f64,
 }
+
+impl Statistics {
+    fn record_level(&self, level: u32, bytes: u64) -> Result<(), Error> {
+        let mut levels = self.bytes_written_per_level.lock().map_err(|_| Error::Poisoned)?;
+        let total = levels.entry(level).or_default();
+        *total = total.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+struct Table {
+    reader: SstableReader,
+    number: u64,
+    path: PathBuf,
+    size: u64,
+    obsolete: AtomicBool,
+}
+
+impl Deref for Table {
+    type Target = SstableReader;
+    fn deref(&self) -> &Self::Target { &self.reader }
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        if self.obsolete.load(Ordering::Acquire) {
+            if let Err(error) = fs::remove_file(&self.path) {
+                eprintln!("failed to remove obsolete SSTable {}: {error}", self.path.display());
+            }
+        }
+    }
+}
+
+type TableVersion = BTreeMap<u32, Vec<Arc<Table>>>;
 
 pub type Entry = (Vec<u8>, Vec<u8>);
 
@@ -116,30 +167,124 @@ struct State {
     dir: PathBuf,
     options: Options,
     cache: Arc<BlockCache>,
-    tables: BTreeMap<u32, Vec<SstableReader>>,
+    tables: Arc<TableVersion>,
     frozen: Option<Arc<BTreeMemtable>>,
-    pending: Option<JoinHandle<Result<SstableReader, Error>>>,
+    pending: Option<Background>,
     wal_paths: Vec<PathBuf>,
     next_file: u64,
+    flushed_sequence: u64,
+    snapshots: BTreeMap<u64, usize>,
+    notify: Sender<MaintenanceSignal>,
+    closing: bool,
+}
+
+enum MaintenanceSignal { Finished, Stop }
+
+struct NotifyOnDrop(Sender<MaintenanceSignal>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) { let _ = self.0.send(MaintenanceSignal::Finished); }
+}
+
+enum Background {
+    Flush { handle: JoinHandle<Result<SstableReader, Error>>, number: u64, sequence: u64 },
+    Compaction(JoinHandle<Result<compaction::Output, Error>>),
+}
+
+impl Background {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Flush { handle, .. } => handle.is_finished(),
+            Self::Compaction(handle) => handle.is_finished(),
+        }
+    }
 }
 
 impl State {
+    fn schedule_compaction(&mut self) -> Result<bool, Error> {
+        if self.pending.is_some() || self.write_failed { return Ok(false); }
+        let mut chosen = None;
+        if self.tables.get(&0).map_or(0, Vec::len) > self.options.l0_compaction_trigger {
+            chosen = Some(0);
+        } else {
+            for (&level, files) in self.tables.iter() {
+                if level == 0 || files.is_empty() { continue; }
+                let mut target = self.options.target_file_size;
+                for _ in 0..level.min(20) { target = target.saturating_mul(10); }
+                let size = files.iter().fold(0u64, |sum, file| sum.saturating_add(file.size));
+                if size > target { chosen = Some(level); break; }
+            }
+        }
+        let Some(level) = chosen else { return Ok(false); };
+        let destination = level.checked_add(1).ok_or(Error::SequenceExhausted)?;
+        let mut inputs = Vec::new();
+        let mut removed = Vec::new();
+        for input_level in [level, destination] {
+            if let Some(files) = self.tables.get(&input_level) {
+                for file in files {
+                    inputs.push(Arc::clone(file));
+                    removed.push((input_level, file.number));
+                }
+            }
+        }
+        let bottom = !self.tables.iter().any(|(&other, files)| other > destination && !files.is_empty());
+        let job = compaction::Job {
+            dir: self.dir.clone(), inputs, removed, level: destination,
+            next_file: self.next_file, last_sequence: self.flushed_sequence,
+            snapshots: self.snapshots.keys().copied().collect(), bottom,
+            options: self.options.clone(), cache: Arc::clone(&self.cache),
+        };
+        let notify = self.notify.clone();
+        self.pending = Some(Background::Compaction(
+            thread::Builder::new().name("lsmkv-compaction".into()).spawn(move || {
+                let _notification = NotifyOnDrop(notify);
+                compaction::run(job)
+            })?,
+        ));
+        Ok(true)
+    }
+
     fn finish_flush(&mut self, wait: bool) -> Result<(), Error> {
-        if !self.pending.as_ref().is_some_and(|handle| wait || handle.is_finished()) {
+        if !self.pending.as_ref().is_some_and(|job| wait || job.is_finished()) {
             return Ok(());
         }
-        let Some(handle) = self.pending.take() else { return Ok(()); };
-        let result = handle.join().map_err(|_| io::Error::other("flush thread panicked"))
-            .and_then(|result| result.map_err(io::Error::other));
-        match result {
-            Ok(table) => {
-                self.tables.entry(0).or_default().push(table);
+        let Some(job) = self.pending.take() else { return Ok(()); };
+        let result: Result<(), Error> = (|| match job {
+            Background::Flush { handle, number, sequence } => {
+                let reader = handle.join().map_err(|_| io::Error::other("flush thread panicked"))??;
+                let path = flush::table_path(&self.dir, number);
+                let size = fs::metadata(&path)?.len();
+                Arc::make_mut(&mut self.tables).entry(0).or_default().push(Arc::new(Table {
+                    reader, number, path, size, obsolete: AtomicBool::new(false),
+                }));
+                self.flushed_sequence = sequence;
                 self.frozen = None;
                 Ok(())
             }
+            Background::Compaction(handle) => {
+                let output = handle.join().map_err(|_| io::Error::other("compaction thread panicked"))??;
+                let levels = Arc::make_mut(&mut self.tables);
+                for (level, number) in &output.removed {
+                    if let Some(files) = levels.get_mut(level) {
+                        if let Some(index) = files.iter().position(|file| file.number == *number) {
+                            files[index].obsolete.store(true, Ordering::Release);
+                            files.remove(index);
+                        }
+                    }
+                }
+                levels.entry(output.level).or_default().extend(output.files);
+                if let Some(files) = levels.get_mut(&output.level) {
+                    files.sort_by(|a, b| a.user_key_bounds().map(|(first, _)| first).cmp(&b.user_key_bounds().map(|(first, _)| first)));
+                }
+                self.next_file = output.next_file;
+                Ok(())
+            }
+        })();
+        match result {
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.write_failed = true;
-                Err(error.into())
+                Err(error)
             }
         }
     }
@@ -171,22 +316,32 @@ impl State {
             options: self.options.clone(),
             cache: Arc::clone(&self.cache),
         };
-        self.pending = Some(thread::Builder::new().name("lsmkv-flush".into()).spawn(move || flush::run(job))?);
+        let sequence = job.last_sequence;
+        let notify = self.notify.clone();
+        let handle = thread::Builder::new().name("lsmkv-flush".into()).spawn(move || {
+            let _notification = NotifyOnDrop(notify);
+            flush::run(job)
+        })?;
+        self.pending = Some(Background::Flush { handle, number: table_number, sequence });
         Ok(())
     }
 }
 
 /// A database handle. Dropping it closes the WAL before releasing the lock.
 pub struct Db {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     _lock: File,
     statistics: Arc<Statistics>,
+    coordinator: Option<JoinHandle<()>>,
 }
 
 impl Db {
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self, Error> {
         if options.bloom_bits_per_key > 30 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "bloom bits per key must be at most 30").into());
+        }
+        if options.target_file_size == 0 || options.l0_stop_writes_trigger <= options.l0_compaction_trigger {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid compaction settings").into());
         }
         let path = path.as_ref();
         fs::create_dir_all(path)?;
@@ -199,9 +354,12 @@ impl Db {
         }
         let version = manifest::open(path)?;
         let cache = Arc::new(BlockCache::new(&options));
-        let mut tables: BTreeMap<u32, Vec<SstableReader>> = BTreeMap::new();
+        let mut tables: TableVersion = BTreeMap::new();
         for &(level, number) in &version.files {
-            let table = SstableReader::open(flush::table_path(path, number), Arc::clone(&cache))?;
+            let table_path = flush::table_path(path, number);
+            let size = fs::metadata(&table_path)?.len();
+            let reader = SstableReader::open(&table_path, Arc::clone(&cache))?;
+            let table = Arc::new(Table { reader, number, path: table_path, size, obsolete: AtomicBool::new(false) });
             if level != 0 && table.user_key_bounds().is_none() {
                 return Err(Error::Corruption("empty deeper-level table"));
             }
@@ -217,15 +375,40 @@ impl Db {
             }
         }
         let (table, wal_paths, wal, next_sequence, next_file) = recover(path, &version, options.sync_policy)?;
-        Ok(Self {
-            state: Mutex::new(State {
+        let (notify, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(State {
                 table, wal, next_sequence, write_failed: false,
-                dir: path.to_path_buf(), options: options.clone(), cache, tables,
+                dir: path.to_path_buf(), options: options.clone(), cache, tables: Arc::new(tables),
                 frozen: None, pending: None, wal_paths, next_file,
-            }),
+                flushed_sequence: version.last_sequence, snapshots: BTreeMap::new(),
+                notify, closing: false,
+            }));
+        let weak = Arc::downgrade(&state);
+        let coordinator = thread::Builder::new().name("lsmkv-maintenance".into()).spawn(move || {
+            while let Ok(signal) = receiver.recv() {
+                if matches!(signal, MaintenanceSignal::Stop) { break; }
+                let Some(state) = weak.upgrade() else { break };
+                let mut state = match state.lock() {
+                    Ok(state) => state,
+                    Err(error) => { eprintln!("maintenance mutex poisoned"); error.into_inner() }
+                };
+                if let Err(error) = state.finish_flush(true).and_then(|()| {
+                    if !state.closing { state.schedule_compaction()?; }
+                    Ok(())
+                }) {
+                    state.write_failed = true;
+                    eprintln!("background maintenance failed: {error}");
+                }
+            }
+        })?;
+        let db = Self {
+            state,
             _lock: lock,
             statistics: options.statistics,
-        })
+            coordinator: Some(coordinator),
+        };
+        db.state()?.schedule_compaction()?;
+        Ok(db)
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, Error> {
@@ -235,9 +418,13 @@ impl Db {
     /// Commit a batch atomically. Empty batches are a no-op.
     pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
         let mut state = self.state()?;
-        state.finish_flush(false)?;
-        if state.write_failed {
-            return Err(Error::WriteFailed);
+        loop {
+            state.finish_flush(false)?;
+            if state.write_failed { return Err(Error::WriteFailed); }
+            state.schedule_compaction()?;
+            if state.tables.get(&0).map_or(0, Vec::len) < state.options.l0_stop_writes_trigger { break; }
+            if state.pending.is_none() { return Err(Error::WriteFailed); }
+            state.finish_flush(true)?;
         }
         if batch.mutations.is_empty() {
             return Ok(());
@@ -253,10 +440,18 @@ impl Db {
             });
             sequence += 1;
         }
+        let logical_bytes = operations.iter().fold(0u64, |total, operation| {
+            let size = match operation {
+                Operation::Put { key, value, .. } => key.len().saturating_add(value.len()),
+                Operation::Delete { key, .. } => key.len(),
+            };
+            total.saturating_add(size as u64)
+        });
         if let Err(error) = state.wal.append(&operations) {
             state.write_failed = true;
             return Err(error.into());
         }
+        let _ = self.statistics.logical_bytes_written.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(logical_bytes)));
         for operation in operations {
             apply(&mut state.table, operation);
         }
@@ -295,7 +490,9 @@ impl Db {
                 Lookup::Missing => {}
             }
         }
-        for (&level, files) in &state.tables {
+        let tables = Arc::clone(&state.tables);
+        drop(state);
+        for (&level, files) in tables.as_ref() {
             if level == 0 {
                 for table in files.iter().rev() {
                     if let Some((kind, value)) = table.get_user_at(key, sequence)? {
@@ -351,21 +548,37 @@ impl Db {
 
     /// Pin the current sequence for consistent reads while writes continue.
     pub fn snapshot(&self) -> Result<Snapshot<'_>, Error> {
-        let state = self.state()?;
-        Ok(Snapshot { db: self, sequence: state.next_sequence - 1 })
+        let mut state = self.state()?;
+        let sequence = state.next_sequence - 1;
+        *state.snapshots.entry(sequence).or_default() += 1;
+        Ok(Snapshot { db: self, sequence })
     }
 
     /// Wait for all writes to reach stable storage.
     pub fn sync(&self) -> Result<(), Error> {
         let mut state = self.state()?;
+        if state.write_failed { return Err(Error::WriteFailed); }
         state.wal.sync()?;
-        state.finish_flush(true)
+        loop {
+            state.finish_flush(true)?;
+            if !state.schedule_compaction()? { break; }
+        }
+        Ok(())
     }
 
     /// Return a snapshot of counters shared through the supplied options.
     pub fn stats(&self) -> Stats {
+        let levels = match self.statistics.bytes_written_per_level.lock() {
+            Ok(levels) => levels.clone(),
+            Err(error) => { eprintln!("statistics mutex poisoned"); error.into_inner().clone() }
+        };
+        let logical = self.statistics.logical_bytes_written.load(Ordering::Relaxed);
+        let written = levels.values().fold(0u64, |total, bytes| total.saturating_add(*bytes));
         Stats {
             bloom_filter_block_reads_avoided: self.statistics.bloom_filter_block_reads_avoided.load(Ordering::Relaxed),
+            logical_bytes_written: logical,
+            bytes_written_per_level: levels,
+            write_amplification: if logical == 0 { 0.0 } else { written as f64 / logical as f64 },
         }
     }
 }
@@ -386,6 +599,19 @@ impl Snapshot<'_> {
     }
 }
 
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        let mut state = match self.db.state.lock() {
+            Ok(state) => state,
+            Err(error) => { eprintln!("database mutex poisoned while releasing snapshot"); error.into_inner() }
+        };
+        if let Some(count) = state.snapshots.get_mut(&self.sequence) {
+            *count -= 1;
+            if *count == 0 { state.snapshots.remove(&self.sequence); }
+        }
+    }
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
         let mut state = match self.state.lock() {
@@ -395,8 +621,14 @@ impl Drop for Db {
                 error.into_inner()
             }
         };
+        state.closing = true;
         if let Err(error) = state.finish_flush(true) {
             eprintln!("failed to complete database flush: {error}");
+        }
+        let _ = state.notify.send(MaintenanceSignal::Stop);
+        drop(state);
+        if let Some(handle) = self.coordinator.take() {
+            if handle.join().is_err() { eprintln!("maintenance thread panicked"); }
         }
     }
 }
