@@ -11,8 +11,16 @@ fs2 = "0.4"
 thiserror = "2"
 
 [dev-dependencies]
+criterion = "=0.5.1"
 proptest = "=1.6.0"
 
 [[bin]]
 name = "lsmkv-cli"
 path = "src/main.rs"
+
+[[bench]]
+name = "workloads"
+harness = false
+
+[profile.release]
+debug = 1
