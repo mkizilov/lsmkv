@@ -26,7 +26,12 @@ pub struct FlushJob {
     pub cache: Arc<BlockCache>,
 }
 
-pub fn run(job: FlushJob) -> Result<SstableReader, Error> {
+pub struct Output {
+    pub reader: SstableReader,
+    pub size: u64,
+}
+
+pub fn run(job: FlushJob) -> Result<Output, Error> {
     let final_path = table_path(&job.dir, job.table_number);
     let temporary = job.dir.join(format!("SST-{:020}.tmp", job.table_number));
     let file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
@@ -39,14 +44,15 @@ pub fn run(job: FlushJob) -> Result<SstableReader, Error> {
     result
 }
 
-fn write_and_publish(job: FlushJob, file: std::fs::File, temporary: &Path, final_path: &Path) -> Result<SstableReader, Error> {
+fn write_and_publish(job: FlushJob, file: std::fs::File, temporary: &Path, final_path: &Path) -> Result<Output, Error> {
     let mut writer = SstableWriter::with_options(file, &job.options)?;
     for (key, value) in job.table.entries() {
         writer.add(key, value)?;
     }
     let file = writer.finish()?;
     file.sync_all()?;
-    job.options.statistics.record_level(0, file.metadata()?.len())?;
+    let size = file.metadata()?.len();
+    job.options.statistics.record_level(0, size)?;
     fs::rename(temporary, final_path)?;
     manifest::sync_dir(&job.dir)?;
     let reader = SstableReader::open(final_path, job.cache)?;
@@ -58,5 +64,5 @@ fn write_and_publish(job: FlushJob, file: std::fs::File, temporary: &Path, final
     })?;
     for path in job.wal_paths { fs::remove_file(path)?; }
     manifest::sync_dir(&job.dir)?;
-    Ok(reader)
+    Ok(Output { reader, size })
 }

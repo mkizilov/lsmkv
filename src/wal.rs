@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const BATCH_TYPE: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

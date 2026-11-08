@@ -117,3 +117,39 @@ fn oversized_deeper_levels_are_compacted_and_split() {
         assert_eq!(db.get(format!("key-{i:02}").as_bytes()).unwrap(), Some(vec![i as u8; 100]));
     }
 }
+
+#[test]
+fn reads_progress_while_sync_waits_for_compaction() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    let dir = TestDir::new();
+    let db = Arc::new(Db::open(&dir.0, Options::default()).unwrap());
+    db.put(b"key", b"value").unwrap();
+    let (release, waiting) = mpsc::channel::<()>();
+    let (started, ready) = mpsc::channel::<()>();
+    {
+        let mut state = db.state().unwrap();
+        let notify = state.notify.clone();
+        let cv = Arc::clone(&state.maintenance_cv);
+        let next_file = state.next_file;
+        let handle = std::thread::spawn(move || {
+            let _notify = crate::NotifyOnDrop(notify, cv);
+            started.send(()).unwrap();
+            waiting.recv().unwrap();
+            Ok(crate::compaction::Output { level: 1, files: Vec::new(), removed: Vec::new(), next_file })
+        });
+        state.pending = Some(crate::Background::Compaction(handle));
+    }
+    ready.recv().unwrap();
+    let sync_db = Arc::clone(&db);
+    let sync = std::thread::spawn(move || sync_db.sync());
+    std::thread::sleep(Duration::from_millis(30));
+    let (send, received) = mpsc::channel();
+    let reader_db = Arc::clone(&db);
+    let reader = std::thread::spawn(move || { send.send(reader_db.get(b"key")).unwrap(); });
+    let result = received.recv_timeout(Duration::from_secs(2));
+    release.send(()).unwrap();
+    assert_eq!(result.unwrap().unwrap(), Some(b"value".to_vec()));
+    reader.join().unwrap();
+    sync.join().unwrap().unwrap();
+}

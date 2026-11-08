@@ -10,9 +10,9 @@ batches newer than the manifest's last flushed sequence into a fresh memtable,
 requiring contiguous sequences and truncating a torn WAL tail to the last valid
 record. It resumes appending to the latest WAL. The lock
 file is never unlinked, so a second process cannot accidentally lock a new
-inode. A mutex serializes reads and writes; each nonempty `WriteBatch` receives
-one sequence per mutation, is appended as a single WAL record, and is applied
-in full to the memtable only after append succeeds. An empty batch is a no-op.
+inode. Each nonempty `WriteBatch` receives one sequence per mutation and is
+applied in full to the memtable only after its WAL append succeeds. An empty
+batch is a no-op.
 After a WAL append error, further writes require reopening: a failed write may
 still have reached disk and can appear after recovery. Scans return current live
 keys in sorted order. `snapshot()` pins the current sequence; its `get` and
@@ -20,6 +20,30 @@ keys in sorted order. `snapshot()` pins the current sequence; its `get` and
 the database and cannot outlive it. Active snapshot sequences are registered
 until their handles are dropped; compaction preserves the newest version and the
 version visible to each snapshot for every user key.
+
+### Concurrency and group commit
+
+`Db` is `Send + Sync` and is intended to be shared through `Arc`. Writers enqueue
+individual atomic batches in FIFO order. One caller becomes leader, waits up to
+1 ms for companions, and combines up to 256 requests and the WAL's 64 MiB limit
+into one record. With `EveryWrite`, that record uses one WAL write and fsync;
+interval synchronization retains its existing delayed-durability semantics. Each
+request remains atomic on replay: a torn shared record loses the whole group,
+while a valid record contains every batch. Completed requests receive individual
+responses, then leadership is handed to a pending writer. A failed WAL append
+poisons further writes and may still have reached disk.
+
+The queue mutex is held only for admission and leader handoff. The state mutex
+protects sequence assignment, memtable publication, snapshot pins and version
+installation; the leader releases it during WAL writes and directory/WAL
+rotation I/O. Readers capture an immutable table version and release the mutex
+before SSTable I/O. Scans pin a sequence and a copy-on-write active memtable,
+then release the mutex before merging. The maintenance coordinator joins completed jobs only;
+writers and `sync` wait on a condition variable that releases the state mutex,
+so compaction does not hold it while doing I/O. Compaction outputs are installed
+under the mutex; obsolete file deletion occurs after it is released. `stats()`
+reports `wal_group_commits` and `committed_write_requests` for process-lifetime
+group-commit observation.
 
 When a batch takes the mutable memtable over `Options::memtable_size` (default
 4 MiB), the database syncs its old WAL, creates and syncs a new numbered WAL,

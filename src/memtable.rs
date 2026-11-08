@@ -53,7 +53,7 @@ pub trait Memtable {
 }
 
 /// A memtable backed by a B-tree.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BTreeMemtable {
     entries: BTreeMap<InternalKey, Vec<u8>>,
     memory_usage: usize,

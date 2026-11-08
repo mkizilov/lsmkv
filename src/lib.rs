@@ -1,15 +1,16 @@
 //! A WAL-backed, in-memory key-value database.
 
 use std::fs::{self, File, OpenOptions};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::ops::Deref;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use fs2::FileExt;
 use memtable::{BTreeMemtable, InternalKey, Kind, Lookup, Memtable};
@@ -86,6 +87,8 @@ pub struct Statistics {
     bloom_filter_block_reads_avoided: AtomicU64,
     logical_bytes_written: AtomicU64,
     bytes_written_per_level: Mutex<BTreeMap<u32, u64>>,
+    wal_group_commits: AtomicU64,
+    committed_write_requests: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -94,6 +97,8 @@ pub struct Stats {
     pub logical_bytes_written: u64,
     pub bytes_written_per_level: BTreeMap<u32, u64>,
     pub write_amplification: f64,
+    pub wal_group_commits: u64,
+    pub committed_write_requests: u64,
 }
 
 impl Statistics {
@@ -160,8 +165,8 @@ impl WriteBatch {
 }
 
 struct State {
-    table: BTreeMemtable,
-    wal: WalWriter,
+    table: Arc<BTreeMemtable>,
+    wal: Arc<WalWriter>,
     next_sequence: u64,
     write_failed: bool,
     dir: PathBuf,
@@ -176,18 +181,23 @@ struct State {
     snapshots: BTreeMap<u64, usize>,
     notify: Sender<MaintenanceSignal>,
     closing: bool,
+    maintenance_cv: Arc<Condvar>,
+    rotating: bool,
 }
 
 enum MaintenanceSignal { Finished, Stop }
 
-struct NotifyOnDrop(Sender<MaintenanceSignal>);
+struct NotifyOnDrop(Sender<MaintenanceSignal>, Arc<Condvar>);
 
 impl Drop for NotifyOnDrop {
-    fn drop(&mut self) { let _ = self.0.send(MaintenanceSignal::Finished); }
+    fn drop(&mut self) {
+        let _ = self.0.send(MaintenanceSignal::Finished);
+        self.1.notify_all();
+    }
 }
 
 enum Background {
-    Flush { handle: JoinHandle<Result<SstableReader, Error>>, number: u64, sequence: u64 },
+    Flush { handle: JoinHandle<Result<flush::Output, Error>>, number: u64, sequence: u64 },
     Compaction(JoinHandle<Result<compaction::Output, Error>>),
 }
 
@@ -202,7 +212,7 @@ impl Background {
 
 impl State {
     fn schedule_compaction(&mut self) -> Result<bool, Error> {
-        if self.pending.is_some() || self.write_failed { return Ok(false); }
+        if self.pending.is_some() || self.rotating || self.write_failed { return Ok(false); }
         let mut chosen = None;
         if self.tables.get(&0).map_or(0, Vec::len) > self.options.l0_compaction_trigger {
             chosen = Some(0);
@@ -235,40 +245,40 @@ impl State {
             options: self.options.clone(), cache: Arc::clone(&self.cache),
         };
         let notify = self.notify.clone();
+        let maintenance_cv = Arc::clone(&self.maintenance_cv);
         self.pending = Some(Background::Compaction(
             thread::Builder::new().name("lsmkv-compaction".into()).spawn(move || {
-                let _notification = NotifyOnDrop(notify);
+                let _notification = NotifyOnDrop(notify, maintenance_cv);
                 compaction::run(job)
             })?,
         ));
         Ok(true)
     }
 
-    fn finish_flush(&mut self, wait: bool) -> Result<(), Error> {
+    fn finish_flush(&mut self, wait: bool) -> Result<(Vec<Arc<Table>>, Option<Arc<BTreeMemtable>>), Error> {
         if !self.pending.as_ref().is_some_and(|job| wait || job.is_finished()) {
-            return Ok(());
+            return Ok((Vec::new(), None));
         }
-        let Some(job) = self.pending.take() else { return Ok(()); };
-        let result: Result<(), Error> = (|| match job {
+        let Some(job) = self.pending.take() else { return Ok((Vec::new(), None)); };
+        let result: Result<(Vec<Arc<Table>>, Option<Arc<BTreeMemtable>>), Error> = (|| match job {
             Background::Flush { handle, number, sequence } => {
-                let reader = handle.join().map_err(|_| io::Error::other("flush thread panicked"))??;
+                let output = handle.join().map_err(|_| io::Error::other("flush thread panicked"))??;
                 let path = flush::table_path(&self.dir, number);
-                let size = fs::metadata(&path)?.len();
                 Arc::make_mut(&mut self.tables).entry(0).or_default().push(Arc::new(Table {
-                    reader, number, path, size, obsolete: AtomicBool::new(false),
+                    reader: output.reader, number, path, size: output.size, obsolete: AtomicBool::new(false),
                 }));
                 self.flushed_sequence = sequence;
-                self.frozen = None;
-                Ok(())
+                Ok((Vec::new(), self.frozen.take()))
             }
             Background::Compaction(handle) => {
                 let output = handle.join().map_err(|_| io::Error::other("compaction thread panicked"))??;
                 let levels = Arc::make_mut(&mut self.tables);
+                let mut retired = Vec::new();
                 for (level, number) in &output.removed {
                     if let Some(files) = levels.get_mut(level) {
                         if let Some(index) = files.iter().position(|file| file.number == *number) {
                             files[index].obsolete.store(true, Ordering::Release);
-                            files.remove(index);
+                            retired.push(files.remove(index));
                         }
                     }
                 }
@@ -277,11 +287,11 @@ impl State {
                     files.sort_by(|a, b| a.user_key_bounds().map(|(first, _)| first).cmp(&b.user_key_bounds().map(|(first, _)| first)));
                 }
                 self.next_file = output.next_file;
-                Ok(())
+                Ok((retired, None))
             }
         })();
         match result {
-            Ok(()) => Ok(()),
+            Ok(retired) => Ok(retired),
             Err(error) => {
                 self.write_failed = true;
                 Err(error)
@@ -289,27 +299,11 @@ impl State {
         }
     }
 
-    fn rotate_and_flush(&mut self) -> Result<(), Error> {
-        self.finish_flush(true)?;
-        self.wal.sync()?;
-        let wal_number = self.next_file;
-        let table_number = wal_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
-        let next_file = table_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
-        let new_path = flush::wal_path(&self.dir, wal_number);
-        let file = OpenOptions::new().write(true).create_new(true).open(&new_path)?;
-        file.sync_all()?;
-        manifest::sync_dir(&self.dir)?;
-        let new_wal = WalWriter::open(&new_path, self.options.sync_policy)?;
-        let old_wal = std::mem::replace(&mut self.wal, new_wal);
-        old_wal.close()?;
-        let old_paths = std::mem::replace(&mut self.wal_paths, vec![new_path]);
-        let frozen = Arc::new(std::mem::take(&mut self.table));
-        self.frozen = Some(Arc::clone(&frozen));
-        self.next_file = next_file;
+    fn install_rotation(&mut self, new_wal: Arc<WalWriter>, new_path: PathBuf, table_number: u64, next_file: u64) -> Result<Arc<WalWriter>, Error> {
         let job = flush::FlushJob {
             dir: self.dir.clone(),
-            table: frozen,
-            wal_paths: old_paths,
+            table: Arc::clone(&self.table),
+            wal_paths: self.wal_paths.clone(),
             table_number,
             next_file,
             last_sequence: self.next_sequence - 1,
@@ -318,12 +312,17 @@ impl State {
         };
         let sequence = job.last_sequence;
         let notify = self.notify.clone();
+        let maintenance_cv = Arc::clone(&self.maintenance_cv);
         let handle = thread::Builder::new().name("lsmkv-flush".into()).spawn(move || {
-            let _notification = NotifyOnDrop(notify);
+            let _notification = NotifyOnDrop(notify, maintenance_cv);
             flush::run(job)
         })?;
+        let old_wal = std::mem::replace(&mut self.wal, new_wal);
+        self.wal_paths = vec![new_path];
+        self.frozen = Some(std::mem::take(&mut self.table));
+        self.next_file = next_file;
         self.pending = Some(Background::Flush { handle, number: table_number, sequence });
-        Ok(())
+        Ok(old_wal)
     }
 }
 
@@ -333,6 +332,23 @@ pub struct Db {
     _lock: File,
     statistics: Arc<Statistics>,
     coordinator: Option<JoinHandle<()>>,
+    maintenance_cv: Arc<Condvar>,
+    write_queue: Mutex<WriteQueue>,
+    write_cv: Condvar,
+}
+
+struct WriteRequest {
+    batch: WriteBatch,
+    size: usize,
+    reply: Sender<WriteResponse>,
+}
+
+enum WriteResponse { Lead, Complete(Result<(), Error>) }
+
+#[derive(Default)]
+struct WriteQueue {
+    pending: VecDeque<WriteRequest>,
+    leader: bool,
 }
 
 impl Db {
@@ -376,14 +392,16 @@ impl Db {
         }
         let (table, wal_paths, wal, next_sequence, next_file) = recover(path, &version, options.sync_policy)?;
         let (notify, receiver) = mpsc::channel();
+        let maintenance_cv = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(State {
-                table, wal, next_sequence, write_failed: false,
+                table: Arc::new(table), wal: Arc::new(wal), next_sequence, write_failed: false,
                 dir: path.to_path_buf(), options: options.clone(), cache, tables: Arc::new(tables),
                 frozen: None, pending: None, wal_paths, next_file,
                 flushed_sequence: version.last_sequence, snapshots: BTreeMap::new(),
-                notify, closing: false,
+                notify, closing: false, maintenance_cv: Arc::clone(&maintenance_cv), rotating: false,
             }));
         let weak = Arc::downgrade(&state);
+        let coordinator_cv = Arc::clone(&maintenance_cv);
         let coordinator = thread::Builder::new().name("lsmkv-maintenance".into()).spawn(move || {
             while let Ok(signal) = receiver.recv() {
                 if matches!(signal, MaintenanceSignal::Stop) { break; }
@@ -392,13 +410,29 @@ impl Db {
                     Ok(state) => state,
                     Err(error) => { eprintln!("maintenance mutex poisoned"); error.into_inner() }
                 };
-                if let Err(error) = state.finish_flush(true).and_then(|()| {
-                    if !state.closing { state.schedule_compaction()?; }
-                    Ok(())
-                }) {
-                    state.write_failed = true;
-                    eprintln!("background maintenance failed: {error}");
+                while state.pending.as_ref().is_some_and(|job| !job.is_finished()) {
+                    state = match coordinator_cv.wait_timeout(state, Duration::from_millis(2)) {
+                        Ok((state, _)) => state,
+                        Err(error) => { eprintln!("maintenance mutex poisoned"); error.into_inner().0 }
+                    };
                 }
+                let retired = match state.finish_flush(false) {
+                    Ok(retired) => retired,
+                    Err(error) => {
+                        state.write_failed = true;
+                        eprintln!("background maintenance failed: {error}");
+                        (Vec::new(), None)
+                    }
+                };
+                if !state.closing {
+                if let Err(error) = state.schedule_compaction() {
+                        state.write_failed = true;
+                        eprintln!("background maintenance failed: {error}");
+                    }
+                }
+                coordinator_cv.notify_all();
+                drop(state);
+                drop(retired);
             }
         })?;
         let db = Self {
@@ -406,8 +440,14 @@ impl Db {
             _lock: lock,
             statistics: options.statistics,
             coordinator: Some(coordinator),
+            maintenance_cv,
+            write_queue: Mutex::new(WriteQueue::default()),
+            write_cv: Condvar::new(),
         };
-        db.state()?.schedule_compaction()?;
+        {
+            let mut state = db.state()?;
+            state.schedule_compaction()?;
+        }
         Ok(db)
     }
 
@@ -417,17 +457,103 @@ impl Db {
 
     /// Commit a batch atomically. Empty batches are a no-op.
     pub fn write(&self, batch: WriteBatch) -> Result<(), Error> {
+        if batch.mutations.is_empty() { return Ok(()); }
+        let size = batch_size(&batch)?;
+        let (reply, receiver) = mpsc::channel();
+        let leader = {
+            let mut queue = self.write_queue.lock().map_err(|_| Error::Poisoned)?;
+            queue.pending.push_back(WriteRequest { batch, size, reply });
+            self.write_cv.notify_one();
+            if queue.leader { false } else { queue.leader = true; true }
+        };
+        if leader { self.run_write_queue(); }
+        loop {
+            match receiver.recv().map_err(|_| io::Error::other("write queue stopped"))? {
+                WriteResponse::Lead => self.run_write_queue(),
+                WriteResponse::Complete(result) => return result,
+            }
+        }
+    }
+
+    fn run_write_queue(&self) {
+            let mut queue = match self.write_queue.lock() {
+                Ok(queue) => queue,
+                Err(error) => {
+                    let mut queue = error.into_inner();
+                    for request in queue.pending.drain(..) { let _ = request.reply.send(WriteResponse::Complete(Err(Error::Poisoned))); }
+                    queue.leader = false;
+                    return;
+                }
+            };
+            if queue.pending.is_empty() { queue.leader = false; return; }
+            if queue.pending.len() == 1 {
+                queue = match self.write_cv.wait_timeout(queue, Duration::from_millis(1)) {
+                    Ok((queue, _)) => queue,
+                    Err(error) => error.into_inner().0,
+                };
+            }
+            let mut size = 4usize;
+            let mut group = Vec::new();
+            let mut operation_count = 0usize;
+            while group.len() < 256 {
+                let Some(next) = queue.pending.front() else { break };
+                if size + next.size > wal::MAX_PAYLOAD
+                    || operation_count + next.batch.mutations.len() > u32::MAX as usize { break; }
+                size += next.size;
+                operation_count += next.batch.mutations.len();
+                if let Some(request) = queue.pending.pop_front() { group.push(request); }
+            }
+            drop(queue);
+            let mut combined = WriteBatch::new();
+            let mut replies = Vec::new();
+            for request in group {
+                combined.mutations.extend(request.batch.mutations);
+                replies.push(request.reply);
+            }
+            let count = replies.len() as u64;
+            match self.commit_group(combined) {
+                Ok(()) => {
+                    self.statistics.wal_group_commits.fetch_add(1, Ordering::Relaxed);
+                    self.statistics.committed_write_requests.fetch_add(count, Ordering::Relaxed);
+                    for reply in replies { let _ = reply.send(WriteResponse::Complete(Ok(()))); }
+                }
+                Err(error) => {
+                    let mut error = Some(error);
+                    for reply in replies {
+                        let result = match error.take() { Some(error) => Err(error), None => Err(Error::WriteFailed) };
+                        let _ = reply.send(WriteResponse::Complete(result));
+                    }
+                }
+            }
+            let mut queue = match self.write_queue.lock() {
+                Ok(queue) => queue,
+                Err(error) => error.into_inner(),
+            };
+            while let Some(next) = queue.pending.front() {
+                if next.reply.send(WriteResponse::Lead).is_ok() { return; }
+                queue.pending.pop_front();
+            }
+            queue.leader = false;
+    }
+
+    fn wait_maintenance<'a>(&self, mut state: MutexGuard<'a, State>) -> Result<MutexGuard<'a, State>, Error> {
+        while state.pending.is_some() || state.rotating {
+            if state.write_failed { return Err(Error::WriteFailed); }
+            state = self.maintenance_cv.wait_timeout(state, Duration::from_millis(5))
+                .map_err(|_| Error::Poisoned)?.0;
+        }
+        if state.write_failed { return Err(Error::WriteFailed); }
+        Ok(state)
+    }
+
+    fn commit_group(&self, batch: WriteBatch) -> Result<(), Error> {
         let mut state = self.state()?;
         loop {
-            state.finish_flush(false)?;
             if state.write_failed { return Err(Error::WriteFailed); }
             state.schedule_compaction()?;
             if state.tables.get(&0).map_or(0, Vec::len) < state.options.l0_stop_writes_trigger { break; }
             if state.pending.is_none() { return Err(Error::WriteFailed); }
-            state.finish_flush(true)?;
-        }
-        if batch.mutations.is_empty() {
-            return Ok(());
+            state = self.wait_maintenance(state)?;
         }
         let count = u64::try_from(batch.mutations.len()).map_err(|_| Error::SequenceExhausted)?;
         let next = state.next_sequence.checked_add(count).ok_or(Error::SequenceExhausted)?;
@@ -447,22 +573,52 @@ impl Db {
             };
             total.saturating_add(size as u64)
         });
-        if let Err(error) = state.wal.append(&operations) {
+        let wal = Arc::clone(&state.wal);
+        drop(state);
+        let append_result = wal.append(&operations);
+        drop(wal);
+        let mut state = self.state()?;
+        if let Err(error) = append_result {
             state.write_failed = true;
             return Err(error.into());
         }
         let _ = self.statistics.logical_bytes_written.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(logical_bytes)));
         for operation in operations {
-            apply(&mut state.table, operation);
+            apply(Arc::make_mut(&mut state.table), operation);
         }
         state.next_sequence = next;
         if state.table.approximate_memory_usage() > state.options.memtable_size {
-            if let Err(error) = state.rotate_and_flush() {
-                state.write_failed = true;
-                return Err(error);
-            }
+            state = self.wait_maintenance(state)?;
+            return self.rotate_and_flush(state);
         }
         Ok(())
+    }
+
+    fn rotate_and_flush(&self, mut state: MutexGuard<'_, State>) -> Result<(), Error> {
+        let wal_number = state.next_file;
+        let table_number = wal_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
+        let next_file = table_number.checked_add(1).ok_or(Error::SequenceExhausted)?;
+        let path = flush::wal_path(&state.dir, wal_number);
+        let dir = state.dir.clone();
+        let policy = state.options.sync_policy;
+        let old = Arc::clone(&state.wal);
+        state.rotating = true;
+        drop(state);
+        let prepared: Result<Arc<WalWriter>, Error> = (|| {
+            old.sync()?;
+            let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+            file.sync_all()?;
+            manifest::sync_dir(&dir)?;
+            Ok(Arc::new(WalWriter::open(&path, policy)?))
+        })();
+        let mut state = self.state()?;
+        let result = prepared.and_then(|wal| state.install_rotation(wal, path, table_number, next_file));
+        state.rotating = false;
+        if result.is_err() { state.write_failed = true; }
+        self.maintenance_cv.notify_all();
+        drop(state);
+        drop(old);
+        result.map(drop)
     }
 
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), Error> {
@@ -476,8 +632,7 @@ impl Db {
     }
 
     fn get_at(&self, key: &[u8], sequence: u64) -> Result<Option<Vec<u8>>, Error> {
-        let mut state = self.state()?;
-        state.finish_flush(false)?;
+        let state = self.state()?;
         match state.table.lookup(key, sequence) {
             Lookup::Value(value) => return Ok(Some(value.to_vec())),
             Lookup::Deleted => return Ok(None),
@@ -526,14 +681,21 @@ impl Db {
     }
 
     fn scan_at<R: RangeBounds<Vec<u8>>>(&self, range: R, sequence: u64) -> Result<Vec<Entry>, Error> {
-        let mut state = self.state()?;
-        state.finish_flush(false)?;
+        let state = self.state()?;
+        let active = Arc::clone(&state.table);
+        let frozen = state.frozen.clone();
+        let tables = Arc::clone(&state.tables);
+        let sequence = sequence.min(state.next_sequence - 1);
+        let mut state = state;
+        *state.snapshots.entry(sequence).or_default() += 1;
+        drop(state);
+        let pin = Snapshot { db: self, sequence };
         let mut sources: Vec<merge::Source<'_>> = Vec::new();
-        sources.push(Box::new(state.table.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
-        if let Some(table) = &state.frozen {
+        sources.push(Box::new(active.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
+        if let Some(table) = &frozen {
             sources.push(Box::new(table.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
         }
-        for files in state.tables.values() {
+        for files in tables.values() {
             for table in files {
                 sources.push(Box::new(table.iter()));
             }
@@ -543,6 +705,7 @@ impl Db {
             let (key, value) = entry?;
             if range.contains(&key) { result.push((key, value)); }
         }
+        drop(pin);
         Ok(result)
     }
 
@@ -556,11 +719,14 @@ impl Db {
 
     /// Wait for all writes to reach stable storage.
     pub fn sync(&self) -> Result<(), Error> {
-        let mut state = self.state()?;
+        let state = self.state()?;
         if state.write_failed { return Err(Error::WriteFailed); }
-        state.wal.sync()?;
+        let wal = Arc::clone(&state.wal);
+        drop(state);
+        wal.sync()?;
+        let mut state = self.state()?;
         loop {
-            state.finish_flush(true)?;
+            state = self.wait_maintenance(state)?;
             if !state.schedule_compaction()? { break; }
         }
         Ok(())
@@ -579,6 +745,8 @@ impl Db {
             logical_bytes_written: logical,
             bytes_written_per_level: levels,
             write_amplification: if logical == 0 { 0.0 } else { written as f64 / logical as f64 },
+            wal_group_commits: self.statistics.wal_group_commits.load(Ordering::Relaxed),
+            committed_write_requests: self.statistics.committed_write_requests.load(Ordering::Relaxed),
         }
     }
 }
@@ -622,8 +790,11 @@ impl Drop for Db {
             }
         };
         state.closing = true;
-        if let Err(error) = state.finish_flush(true) {
-            eprintln!("failed to complete database flush: {error}");
+        while state.pending.is_some() {
+            state = match self.maintenance_cv.wait_timeout(state, Duration::from_millis(5)) {
+                Ok((state, _)) => state,
+                Err(error) => { eprintln!("database mutex poisoned while closing"); error.into_inner().0 }
+            };
         }
         let _ = state.notify.send(MaintenanceSignal::Stop);
         drop(state);
@@ -637,6 +808,25 @@ fn numbered(name: &str, prefix: &str, suffix: &str) -> Option<u64> {
     let digits = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
     if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
     digits.parse().ok()
+}
+
+fn batch_size(batch: &WriteBatch) -> Result<usize, Error> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "write batch exceeds WAL record limit");
+    if u32::try_from(batch.mutations.len()).is_err() { return Err(invalid().into()); }
+    let mut size = 0usize;
+    for mutation in &batch.mutations {
+        let (key, value_len) = match mutation {
+            Mutation::Put(key, value) => (key, value.len()),
+            Mutation::Delete(key) => (key, 0),
+        };
+        if u32::try_from(key.len()).is_err() || u32::try_from(value_len).is_err() {
+            return Err(invalid().into());
+        }
+        size = size.checked_add(17).and_then(|n| n.checked_add(key.len()))
+            .and_then(|n| n.checked_add(value_len)).ok_or_else(invalid)?;
+    }
+    if size > wal::MAX_PAYLOAD - 4 { return Err(invalid().into()); }
+    Ok(size)
 }
 
 fn recover(
