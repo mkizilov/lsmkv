@@ -3,6 +3,7 @@
 This document describes the intended engine, not functionality provided by the
 initial API stubs. Keys and values are arbitrary bytes, ordered lexicographically.
 The initial API returns a not-implemented error and does not create a database.
+The standalone B-tree memtable is implemented but is not yet connected to `Db`.
 
 ## Internal keys and storage
 
@@ -11,6 +12,12 @@ kind is `Put` or `Delete`. Internal keys sort by user key ascending and then
 sequence number descending; kind breaks any remaining ties deterministically.
 Sequence numbers are monotonically assigned to writes. Deletes are tombstones,
 not immediate removal, so older values cannot reappear from lower levels.
+The memtable exposes a snapshot lookup that distinguishes a tombstone from a
+missing key for future cross-layer reads; its convenience `get` maps both to
+not found. Its approximate memory accounting includes key and value lengths
+and fixed entry sizes, but excludes B-tree allocation overhead and spare capacity.
+Identical internal keys replace their previous values; callers must assign unique
+sequence numbers to distinct mutations, including differing kinds for one key.
 
 The write-ahead log (WAL) records mutations before they enter the mutable
 memtable, an in-memory ordered map of internal keys. A full memtable becomes an

@@ -3,6 +3,8 @@
 use std::ops::RangeBounds;
 use std::path::Path;
 
+pub mod memtable;
+
 /// Errors returned by the database.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
