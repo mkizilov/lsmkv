@@ -4,7 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::ops::RangeBounds;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fs2::FileExt;
 use memtable::{BTreeMemtable, InternalKey, Kind, Memtable};
@@ -39,12 +40,32 @@ pub struct Options {
     pub sync_policy: SyncPolicy,
     /// Shared SSTable block-cache capacity in bytes; zero disables caching.
     pub block_cache_capacity: usize,
+    /// Bloom-filter bits per distinct user key (0 disables filters, maximum 30).
+    pub bloom_bits_per_key: usize,
+    /// Counters shared by database and SSTable readers using these options.
+    pub statistics: Arc<Statistics>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { sync_policy: SyncPolicy::EveryWrite, block_cache_capacity: 8 * 1024 * 1024 }
+        Self {
+            sync_policy: SyncPolicy::EveryWrite,
+            block_cache_capacity: 8 * 1024 * 1024,
+            bloom_bits_per_key: 10,
+            statistics: Arc::new(Statistics::default()),
+        }
     }
+}
+
+/// Shared counters; clone `Options` to share them between a database and readers.
+#[derive(Debug, Default)]
+pub struct Statistics {
+    bloom_filter_block_reads_avoided: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct Stats {
+    pub bloom_filter_block_reads_avoided: u64,
 }
 
 pub type Entry = (Vec<u8>, Vec<u8>);
@@ -87,6 +108,7 @@ struct State {
 pub struct Db {
     state: Mutex<State>,
     _lock: File,
+    statistics: Arc<Statistics>,
 }
 
 impl Db {
@@ -127,6 +149,7 @@ impl Db {
         Ok(Self {
             state: Mutex::new(State { table, wal, next_sequence, write_failed: false }),
             _lock: lock,
+            statistics: options.statistics,
         })
     }
 
@@ -188,6 +211,13 @@ impl Db {
     /// Wait for all writes to reach stable storage.
     pub fn sync(&self) -> Result<(), Error> {
         self.state()?.wal.sync().map_err(Error::from)
+    }
+
+    /// Return a snapshot of counters shared through the supplied options.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            bloom_filter_block_reads_avoided: self.statistics.bloom_filter_block_reads_avoided.load(Ordering::Relaxed),
+        }
     }
 }
 

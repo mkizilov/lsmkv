@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use crate::encoding::{get_u32, get_u64, get_varint};
 use crate::memtable::{InternalKey, Kind};
 use crate::wal::crc32c;
-use crate::{Error, Options};
+use crate::{Error, Options, Statistics};
 
 use super::FOOTER_MAGIC;
+use super::bloom::Bloom;
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 type CacheKey = (u64, u64);
@@ -25,6 +26,7 @@ struct CacheState {
 pub struct BlockCache {
     capacity: usize,
     state: Mutex<CacheState>,
+    statistics: Arc<Statistics>,
 }
 
 impl BlockCache {
@@ -32,7 +34,12 @@ impl BlockCache {
         Self {
             capacity: options.block_cache_capacity,
             state: Mutex::new(CacheState { blocks: HashMap::new(), order: VecDeque::new(), bytes: 0 }),
+            statistics: Arc::clone(&options.statistics),
         }
+    }
+
+    fn contains(&self, key: CacheKey) -> Result<bool, Error> {
+        Ok(self.state.lock().map_err(|_| Error::Poisoned)?.blocks.contains_key(&key))
     }
 
     fn get(&self, key: CacheKey) -> Result<Option<Arc<Block>>, Error> {
@@ -122,6 +129,7 @@ pub struct SstableReader {
     index: Vec<IndexEntry>,
     cache: Arc<BlockCache>,
     id: u64,
+    filter: Option<Bloom>,
 }
 
 impl SstableReader {
@@ -139,14 +147,13 @@ impl SstableReader {
         let filter_size = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
         let index_offset = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
         let index_size = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
-        if get_u64(&mut f) != Some(FOOTER_MAGIC) || filter_size != 4
+        if get_u64(&mut f) != Some(FOOTER_MAGIC) || filter_size < 4
             || filter_offset.checked_add(filter_size) != Some(index_offset)
             || index_offset.checked_add(index_size) != Some(footer_start) {
             return Err(Error::Corruption("footer layout"));
         }
-        if !read_block(&mut file, filter_offset, filter_size, footer_start)?.is_empty() {
-            return Err(Error::Corruption("unsupported filter"));
-        }
+        let filter_bytes = read_block(&mut file, filter_offset, filter_size, footer_start)?;
+        let filter = Bloom::parse(&filter_bytes)?;
         let index_bytes = read_block(&mut file, index_offset, index_size, footer_start)?;
         let mut input = index_bytes.as_slice();
         let count = get_u32(&mut input).ok_or(Error::Corruption("index count"))? as usize;
@@ -163,9 +170,21 @@ impl SstableReader {
             offset = block_offset.checked_add(size).ok_or(Error::Corruption("index overflow"))?;
             if offset > filter_offset { return Err(Error::Corruption("data block range")); }
             let raw = read_block(&mut file, block_offset, size, filter_offset)?;
-            let (_, first, actual_last) = parse_block(raw)?;
+            let (block, first, actual_last) = parse_block(raw)?;
             if actual_last != last || previous.as_ref().is_some_and(|key| *key >= first) {
                 return Err(Error::Corruption("index key order"));
+            }
+            if let Some(filter) = &filter {
+                let mut position = 0;
+                let mut previous_bytes = Vec::new();
+                while position < block.entries_end {
+                    let (next, bytes, key, _) = block.entry(position, &previous_bytes)?;
+                    if !filter.may_contain(&key.user_key) {
+                        return Err(Error::Corruption("Bloom filter missing key"));
+                    }
+                    position = next;
+                    previous_bytes = bytes;
+                }
             }
             previous = Some(last.clone());
             index.push(IndexEntry { last, offset: block_offset, size });
@@ -173,7 +192,7 @@ impl SstableReader {
         if !input.is_empty() || offset != filter_offset { return Err(Error::Corruption("index trailing data")); }
         let id = NEXT_TABLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Corruption("table identifier exhausted"))?;
-        Ok(Self { file: Mutex::new(file), index, cache, id })
+        Ok(Self { file: Mutex::new(file), index, cache, id, filter })
     }
 
     fn block(&self, number: usize) -> Result<Arc<Block>, Error> {
@@ -191,6 +210,14 @@ impl SstableReader {
 
     /// Find an exact internal key using the index and restart-point binary searches.
     pub fn get(&self, target: &InternalKey) -> Result<Option<Vec<u8>>, Error> {
+        let number = self.index.partition_point(|entry| entry.last < *target);
+        let Some(entry) = self.index.get(number) else { return Ok(None); };
+        if self.filter.as_ref().is_some_and(|filter| !filter.may_contain(&target.user_key)) {
+            if !self.cache.contains((self.id, entry.offset))? {
+                self.cache.statistics.bloom_filter_block_reads_avoided.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(None);
+        }
         let mut iterator = self.iter();
         iterator.seek(target)?;
         match iterator.next() {

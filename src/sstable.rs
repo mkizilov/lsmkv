@@ -7,6 +7,7 @@ use crate::memtable::{InternalKey, Kind};
 use crate::wal::crc32c;
 
 mod reader;
+mod bloom;
 pub use reader::{BlockCache, SstableIterator, SstableReader};
 
 const TARGET_BLOCK_SIZE: usize = 4096;
@@ -30,6 +31,8 @@ pub struct SstableWriter<W: Write> {
     last_key: Option<InternalKey>,
     index: Vec<BlockIndex>,
     failed: bool,
+    bloom_bits_per_key: usize,
+    bloom_hashes: Vec<u64>,
 }
 
 impl<W: Write> SstableWriter<W> {
@@ -44,7 +47,19 @@ impl<W: Write> SstableWriter<W> {
             last_key: None,
             index: Vec::new(),
             failed: false,
+            bloom_bits_per_key: 10,
+            bloom_hashes: Vec::new(),
         }
+    }
+
+    /// Configure the filter using database options; zero disables the filter.
+    pub fn with_options(output: W, options: &crate::Options) -> io::Result<Self> {
+        if options.bloom_bits_per_key > 30 {
+            return Err(invalid("bloom bits per key must be at most 30"));
+        }
+        let mut writer = Self::new(output);
+        writer.bloom_bits_per_key = options.bloom_bits_per_key;
+        Ok(writer)
     }
 
     /// Append one entry; duplicate or out-of-order internal keys are rejected.
@@ -89,6 +104,9 @@ impl<W: Write> SstableWriter<W> {
         self.data.extend_from_slice(&entry);
         self.block_entries += 1;
         self.previous_bytes = encoded;
+        if self.bloom_bits_per_key != 0 && self.last_key.as_ref().is_none_or(|last| last.user_key != key.user_key) {
+            self.bloom_hashes.push(bloom::hash(&key.user_key));
+        }
         self.last_key = Some(key.clone());
         Ok(())
     }
@@ -99,7 +117,8 @@ impl<W: Write> SstableWriter<W> {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "table writer failed"));
         }
         self.flush_data()?;
-        let (filter_offset, filter_size) = self.write_block(&[])?;
+        let filter = bloom::build(&self.bloom_hashes, self.bloom_bits_per_key)?;
+        let (filter_offset, filter_size) = self.write_block(&filter)?;
         let mut index = Vec::new();
         put_u32(&mut index, u32::try_from(self.index.len()).map_err(|_| invalid("too many blocks"))?);
         for entry in &self.index {
@@ -165,7 +184,7 @@ fn encode_key(key: &InternalKey) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_key, SstableWriter, FOOTER_MAGIC};
+    use super::{bloom::Bloom, encode_key, SstableWriter, FOOTER_MAGIC};
     use crate::encoding::{get_u32, get_u64, get_varint};
     use crate::memtable::{InternalKey, Kind};
     use crate::wal::crc32c;
@@ -204,7 +223,7 @@ mod tests {
         assert_eq!(get_u64(&mut footer), Some(FOOTER_MAGIC));
         assert_eq!(index_offset + index_size, (bytes.len() - 40) as u64);
         assert_eq!(filter_offset + filter_size, index_offset);
-        assert!(block(&bytes, filter_offset, filter_size).is_empty());
+        assert!(Bloom::parse(block(&bytes, filter_offset, filter_size)).unwrap().is_some());
         let mut index = block(&bytes, index_offset, index_size);
         let count = get_u32(&mut index).unwrap();
         assert!(count > 1);
@@ -260,7 +279,7 @@ mod tests {
         let filter_size = get_u64(&mut footer).unwrap();
         let index_offset = get_u64(&mut footer).unwrap();
         let index_size = get_u64(&mut footer).unwrap();
-        assert!(block(&bytes, filter_offset, filter_size).is_empty());
+        assert!(Bloom::parse(block(&bytes, filter_offset, filter_size)).unwrap().is_some());
         assert_eq!(get_u32(&mut block(&bytes, index_offset, index_size)), Some(0));
         let mut writer = SstableWriter::new(Vec::new());
         let key = InternalKey::new(b"a".to_vec(), 2, Kind::Put);

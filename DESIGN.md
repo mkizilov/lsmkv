@@ -69,7 +69,7 @@ live.
 
 ### SSTable writer format, version 1
 
-The standalone writer emits data blocks, an empty filter block, an index block,
+The standalone writer emits data blocks, a filter block, an index block,
 and a 40-byte footer, in that order. The writer accepts strictly increasing
 internal keys and requires empty values for deletes. Empty tables are valid.
 All fixed-width integers are little-endian. Varints are canonical unsigned LEB128
@@ -91,8 +91,23 @@ u32 byte offset of each restart entry from the beginning of the block payload,
 followed by the u32 number of restarts. A block targets 4096 bytes including
 restart metadata and CRC; a single oversized entry occupies its own block.
 
-The filter block has an empty payload for now (and therefore just its CRC). The
-index payload begins with a u32 block count followed by one entry per data
+The filter block payload is `version:u8, probes:u8, bit_count:u64, bits[]`:
+version is 1; bit count is a multiple of eight and at least 64. Bits use the
+least-significant-bit-first convention within each byte. An empty payload is a
+legacy/disabled filter and must be treated as "may contain" for every key. The
+writer builds the filter over distinct user keys, including tombstones; default
+bits per key is 10, configurable from 0 (disabled) to 30. For n keys and b bits
+per key, the size is max(64, n*b) rounded up to a multiple of eight. The probe
+count is clamp(round(b*0.69), 1, 30).
+
+Hashing starts with 64-bit FNV-1a (offset 0xcbf29ce484222325, prime
+0x100000001b3) over the user key, then applies `mix`: xor with a 30-bit right
+shift, multiply by 0xbf58476d1ce4e5b9, xor with a 27-bit right shift, multiply
+by 0x94d049bb133111eb, then xor with a 31-bit right shift. Arithmetic wraps at
+64 bits. If the result is h, the odd step is mix(h xor 0x9e3779b97f4a7c15) OR
+1; probe i uses wrapping(h + i*step) modulo bit count.
+
+The index payload begins with a u32 block count followed by one entry per data
 block: `key_len:varint, last_encoded_key, offset:u64, size:u64`. Offsets are
 absolute from the start of the SSTable and the index follows data-block order.
 The footer has five u64 fields: filter offset, filter size, index offset, index
@@ -101,7 +116,7 @@ the caller must flush/sync, atomically publish, and manage incomplete output.
 
 The standalone reader validates the complete file at open, including each block
 CRC, all restart entries, index key ordering, contiguous block layout, filter
-size, footer offsets, and magic. These constraints detect a single-byte change
+format and membership of stored keys, footer offsets, and magic. These constraints detect a single-byte change
 anywhere, including the footer, although the footer has no checksum and the
 format does not promise detection of coordinated multi-byte footer changes.
 Point lookups binary-search the index and restart keys, then scan within a
@@ -114,7 +129,13 @@ snapshot visibility. SSTable files must remain immutable after opening.
 Cached block payload and decoded restart offsets count against that limit, not
 allocator overhead or blocks still referenced by active iterators after eviction.
 The cache is keyed by a unique reader identity and block offset and evicts least
-recently used blocks. It is not yet used by `Db`, which has no SSTables.
+recently used blocks. Point lookups consult the filter before accessing the data
+block; iterator seeks do not use the filter. `Db::stats()` exposes the shared
+`bloom_filter_block_reads_avoided` counter: it increments when a negative filter
+result eliminates an uncached candidate block read, excluding validation reads
+at open. Cloning the same `Options` into `Db` and the shared `BlockCache` shares
+this counter; it is an estimate under concurrent cache changes. The cache and
+filters are not yet used by `Db` itself, which has no SSTables.
 
 ## Paths
 
