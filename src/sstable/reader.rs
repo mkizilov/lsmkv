@@ -130,6 +130,8 @@ pub struct SstableReader {
     cache: Arc<BlockCache>,
     id: u64,
     filter: Option<Bloom>,
+    first_user_key: Option<Vec<u8>>,
+    last_user_key: Option<Vec<u8>>,
 }
 
 impl SstableReader {
@@ -161,6 +163,7 @@ impl SstableReader {
         let mut index = Vec::new();
         let mut offset = 0u64;
         let mut previous: Option<InternalKey> = None;
+        let mut first_user_key = None;
         for _ in 0..count {
             let key_len = length(&mut input)?;
             let last = decode_key(take(&mut input, key_len)?)?;
@@ -171,6 +174,7 @@ impl SstableReader {
             if offset > filter_offset { return Err(Error::Corruption("data block range")); }
             let raw = read_block(&mut file, block_offset, size, filter_offset)?;
             let (block, first, actual_last) = parse_block(raw)?;
+            if first_user_key.is_none() { first_user_key = Some(first.user_key.clone()); }
             if actual_last != last || previous.as_ref().is_some_and(|key| *key >= first) {
                 return Err(Error::Corruption("index key order"));
             }
@@ -192,7 +196,8 @@ impl SstableReader {
         if !input.is_empty() || offset != filter_offset { return Err(Error::Corruption("index trailing data")); }
         let id = NEXT_TABLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Corruption("table identifier exhausted"))?;
-        Ok(Self { file: Mutex::new(file), index, cache, id, filter })
+        let last_user_key = previous.map(|key| key.user_key);
+        Ok(Self { file: Mutex::new(file), index, cache, id, filter, first_user_key, last_user_key })
     }
 
     fn block(&self, number: usize) -> Result<Arc<Block>, Error> {
@@ -222,7 +227,12 @@ impl SstableReader {
 
     /// Find the newest internal version for a user key, including tombstones.
     pub fn get_user(&self, user_key: &[u8]) -> Result<Option<(Kind, Vec<u8>)>, Error> {
-        let target = InternalKey::new(user_key.to_vec(), u64::MAX, Kind::Put);
+        self.get_user_at(user_key, u64::MAX)
+    }
+
+    /// Find the newest version visible at a sequence, including tombstones.
+    pub fn get_user_at(&self, user_key: &[u8], sequence: u64) -> Result<Option<(Kind, Vec<u8>)>, Error> {
+        let target = InternalKey::new(user_key.to_vec(), sequence, Kind::Put);
         if !self.may_read(&target)? { return Ok(None); }
         let mut iterator = self.iter();
         iterator.seek(&target)?;
@@ -231,6 +241,11 @@ impl SstableReader {
             Some(Err(error)) => Err(error),
             _ => Ok(None),
         }
+    }
+
+    /// Inclusive user-key bounds; empty tables have no bounds.
+    pub fn user_key_bounds(&self) -> Option<(&[u8], &[u8])> {
+        Some((self.first_user_key.as_deref()?, self.last_user_key.as_deref()?))
     }
 
     fn may_read(&self, target: &InternalKey) -> Result<bool, Error> {

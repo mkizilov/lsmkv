@@ -1,8 +1,8 @@
 # lsmkv design
 
 Keys and values are arbitrary bytes, ordered lexicographically. The current
-`Db` uses a WAL, B-tree memtables, and level-0 SSTables tracked in a manifest.
-Compaction and deeper levels below describe the intended future engine.
+`Db` uses a WAL, B-tree memtables, and manifest-tracked SSTables. It writes
+level 0 and reads deeper levels; compaction remains future work.
 
 `Db::open` holds an exclusive OS advisory lock on the persistent `LOCK` file for
 the handle's lifetime. It loads the manifest and its SSTables, then replays WAL
@@ -15,13 +15,22 @@ one sequence per mutation, is appended as a single WAL record, and is applied
 in full to the memtable only after append succeeds. An empty batch is a no-op.
 After a WAL append error, further writes require reopening: a failed write may
 still have reached disk and can appear after recovery. Scans return current live
-keys in sorted order. There is no concurrent snapshot API yet.
+keys in sorted order. `snapshot()` pins the current sequence; its `get` and
+`scan` filter out later writes even across subsequent flushes. Snapshots borrow
+the database and cannot outlive it. All versions are currently retained, so no
+separate pin registry is needed; future compaction must preserve versions needed
+by active snapshots.
 
 When a batch takes the mutable memtable over `Options::memtable_size` (default
 4 MiB), the database syncs its old WAL, creates and syncs a new numbered WAL,
 then freezes the old memtable and flushes it on a background thread. At most one
 flush is in flight; a subsequent rotation waits for it. Reads see the mutable
-memtable, the frozen memtable, and live level-0 tables in newest-first order.
+memtable, the frozen memtable, live level-0 tables in newest-first order, and
+then deeper levels in ascending level order. Each deeper level has non-overlapping
+user-key ranges, validated at open and binary-searched for a single candidate.
+Scans heap-merge all ordered sources by internal key, discard versions newer
+than the read sequence, and return the first visible version per user key,
+suppressing tombstones. The current `scan` API materializes the result as a Vec.
 `sync` and database drop wait for pending flushes. A failed flush stops further
 writes and retains the frozen table for recovery.
 
@@ -46,7 +55,8 @@ next file number, u64 last flushed sequence, u32 added count, u32 removed count,
 then added and removed entries respectively, each `(level:u32, file:u64)`.
 Complete edits with bad checksums are rejected; a truncated final edit is
 discarded and truncated. File additions/removals are applied in order. This
-implementation creates level-0 files only and rejects other live levels.
+implementation creates level-0 files only; manifest-listed deeper levels are
+readable when their user-key ranges do not overlap.
 
 ## Internal keys and storage
 

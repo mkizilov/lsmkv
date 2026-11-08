@@ -20,6 +20,9 @@ pub mod sstable;
 pub mod wal;
 mod manifest;
 mod flush;
+mod merge;
+#[cfg(test)]
+mod read_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -113,7 +116,7 @@ struct State {
     dir: PathBuf,
     options: Options,
     cache: Arc<BlockCache>,
-    tables: Vec<SstableReader>,
+    tables: BTreeMap<u32, Vec<SstableReader>>,
     frozen: Option<Arc<BTreeMemtable>>,
     pending: Option<JoinHandle<Result<SstableReader, Error>>>,
     wal_paths: Vec<PathBuf>,
@@ -130,7 +133,7 @@ impl State {
             .and_then(|result| result.map_err(io::Error::other));
         match result {
             Ok(table) => {
-                self.tables.push(table);
+                self.tables.entry(0).or_default().push(table);
                 self.frozen = None;
                 Ok(())
             }
@@ -196,10 +199,22 @@ impl Db {
         }
         let version = manifest::open(path)?;
         let cache = Arc::new(BlockCache::new(&options));
-        let mut tables = Vec::new();
+        let mut tables: BTreeMap<u32, Vec<SstableReader>> = BTreeMap::new();
         for &(level, number) in &version.files {
-            if level != 0 { return Err(Error::Corruption("unsupported table level")); }
-            tables.push(SstableReader::open(flush::table_path(path, number), Arc::clone(&cache))?);
+            let table = SstableReader::open(flush::table_path(path, number), Arc::clone(&cache))?;
+            if level != 0 && table.user_key_bounds().is_none() {
+                return Err(Error::Corruption("empty deeper-level table"));
+            }
+            tables.entry(level).or_default().push(table);
+        }
+        for (&level, files) in &mut tables {
+            if level == 0 { continue; }
+            files.sort_by(|a, b| a.user_key_bounds().map(|(first, _)| first).cmp(&b.user_key_bounds().map(|(first, _)| first)));
+            for pair in files.windows(2) {
+                let (_, previous_last) = pair[0].user_key_bounds().ok_or(Error::Corruption("empty deeper-level table"))?;
+                let (next_first, _) = pair[1].user_key_bounds().ok_or(Error::Corruption("empty deeper-level table"))?;
+                if previous_last >= next_first { return Err(Error::Corruption("overlapping table ranges")); }
+            }
         }
         let (table, wal_paths, wal, next_sequence, next_file) = recover(path, &version, options.sync_policy)?;
         Ok(Self {
@@ -262,24 +277,42 @@ impl Db {
     }
 
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, Error> {
-        let key = key.as_ref();
+        self.get_at(key.as_ref(), u64::MAX)
+    }
+
+    fn get_at(&self, key: &[u8], sequence: u64) -> Result<Option<Vec<u8>>, Error> {
         let mut state = self.state()?;
         state.finish_flush(false)?;
-        match state.table.lookup(key, u64::MAX) {
+        match state.table.lookup(key, sequence) {
             Lookup::Value(value) => return Ok(Some(value.to_vec())),
             Lookup::Deleted => return Ok(None),
             Lookup::Missing => {}
         }
         if let Some(table) = &state.frozen {
-            match table.lookup(key, u64::MAX) {
+            match table.lookup(key, sequence) {
                 Lookup::Value(value) => return Ok(Some(value.to_vec())),
                 Lookup::Deleted => return Ok(None),
                 Lookup::Missing => {}
             }
         }
-        for table in state.tables.iter().rev() {
-            if let Some((kind, value)) = table.get_user(key)? {
-                return Ok(if kind == Kind::Put { Some(value) } else { None });
+        for (&level, files) in &state.tables {
+            if level == 0 {
+                for table in files.iter().rev() {
+                    if let Some((kind, value)) = table.get_user_at(key, sequence)? {
+                        return Ok(if kind == Kind::Put { Some(value) } else { None });
+                    }
+                }
+            } else {
+                let position = files.partition_point(|table| {
+                    table.user_key_bounds().is_some_and(|(_, last)| last < key)
+                });
+                if let Some(table) = files.get(position) {
+                    if table.user_key_bounds().is_some_and(|(first, last)| first <= key && key <= last) {
+                        if let Some((kind, value)) = table.get_user_at(key, sequence)? {
+                            return Ok(if kind == Kind::Put { Some(value) } else { None });
+                        }
+                    }
+                }
             }
         }
         Ok(None)
@@ -292,27 +325,34 @@ impl Db {
     }
 
     pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<Entry>, Error> {
+        self.scan_at(range, u64::MAX)
+    }
+
+    fn scan_at<R: RangeBounds<Vec<u8>>>(&self, range: R, sequence: u64) -> Result<Vec<Entry>, Error> {
         let mut state = self.state()?;
         state.finish_flush(false)?;
-        let mut values: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        let mut add = |key: &InternalKey, value: &[u8]| {
-            if range.contains(&key.user_key) {
-                values.entry(key.user_key.clone()).or_insert_with(|| {
-                    if key.kind == Kind::Put { Some(value.to_vec()) } else { None }
-                });
-            }
-        };
-        for (key, value) in state.table.entries() { add(key, value); }
+        let mut sources: Vec<merge::Source<'_>> = Vec::new();
+        sources.push(Box::new(state.table.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
         if let Some(table) = &state.frozen {
-            for (key, value) in table.entries() { add(key, value); }
+            sources.push(Box::new(table.entries().map(|(key, value)| Ok((key.clone(), value.clone())))));
         }
-        for table in state.tables.iter().rev() {
-            for entry in table.iter() {
-                let (key, value) = entry?;
-                add(&key, &value);
+        for files in state.tables.values() {
+            for table in files {
+                sources.push(Box::new(table.iter()));
             }
         }
-        Ok(values.into_iter().filter_map(|(key, value)| value.map(|value| (key, value))).collect())
+        let mut result = Vec::new();
+        for entry in merge::MergeIterator::new(sources, sequence)? {
+            let (key, value) = entry?;
+            if range.contains(&key) { result.push((key, value)); }
+        }
+        Ok(result)
+    }
+
+    /// Pin the current sequence for consistent reads while writes continue.
+    pub fn snapshot(&self) -> Result<Snapshot<'_>, Error> {
+        let state = self.state()?;
+        Ok(Snapshot { db: self, sequence: state.next_sequence - 1 })
     }
 
     /// Wait for all writes to reach stable storage.
@@ -327,6 +367,22 @@ impl Db {
         Stats {
             bloom_filter_block_reads_avoided: self.statistics.bloom_filter_block_reads_avoided.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// A sequence-pinned read view. Versions are retained while snapshots exist.
+pub struct Snapshot<'a> {
+    db: &'a Db,
+    sequence: u64,
+}
+
+impl Snapshot<'_> {
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, Error> {
+        self.db.get_at(key.as_ref(), self.sequence)
+    }
+
+    pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<Entry>, Error> {
+        self.db.scan_at(range, self.sequence)
     }
 }
 
