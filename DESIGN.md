@@ -27,6 +27,27 @@ On recovery, live SSTables are recovered from the manifest and unflushed WAL
 records are replayed into memtables. WAL retirement must happen only after the
 corresponding flush is durably recorded.
 
+### WAL format and synchronization
+
+The standalone WAL is not yet connected to `Db`. All integers are little-endian.
+Each record has a four-byte CRC32C (Castagnoli), a four-byte payload length, a
+one-byte record type (1 for batch), and the payload. The CRC covers the length,
+type, and payload, not the CRC field. Payloads are limited to 64 MiB and contain
+a nonzero u32 operation count followed by operations: one-byte kind (1 Put,
+2 Delete), u64 sequence, u32 key length, u32 value length, key bytes, and value
+bytes. A Delete must have zero value length. Empty keys and Put values are valid.
+
+The reader returns complete validated batches in order, stopping permanently at
+the first incomplete, invalid, or corrupt record; `valid_bytes` identifies the
+safe prefix to retain. I/O errors are returned separately. A writer refuses to
+append to a damaged tail: recovery must truncate it to the valid prefix first.
+The writer syncs each append or uses a worker to sync within the configured
+interval after the first unsynced append, even during inactivity. Interval-mode
+acknowledgement is not a durability guarantee; explicit `sync` or `close` waits
+for durability and reports worker errors. Close the writer explicitly to observe
+final errors; implicit drop reports errors to stderr. Directory synchronization,
+WAL rotation, and recovery orchestration remain future engine work.
+
 Each SSTable contains sorted data blocks, a block index mapping key ranges to
 block locations, and bloom filters that can rule out a user key without reading
 its data block. The manifest records the live SSTable files and their levels;

@@ -4,6 +4,7 @@ use std::ops::RangeBounds;
 use std::path::Path;
 
 pub mod memtable;
+pub mod wal;
 
 /// Errors returned by the database.
 #[derive(Debug, thiserror::Error)]
