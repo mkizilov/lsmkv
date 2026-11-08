@@ -31,23 +31,20 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
 
 pub fn open(dir: &Path) -> Result<Version, Error> {
     let current = dir.join("CURRENT");
-    if current.exists() {
+    let current_exists = current.exists();
+    if current_exists {
         if fs::read(&current)? != CURRENT.as_bytes() { return Err(Error::Corruption("CURRENT")); }
     } else {
         let manifest = dir.join(NAME);
-        if !manifest.exists() {
-            let file = OpenOptions::new().write(true).create_new(true).open(&manifest)?;
+        if !manifest.exists() || fs::metadata(&manifest)?.len() == 0 {
+            let temporary = dir.join("MANIFEST-000001.tmp");
+            let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
+            let initial = Edit { added: Vec::new(), removed: Vec::new(), next_file: 1, last_sequence: 0 };
+            file.write_all(&encode(&initial)?)?;
             file.sync_all()?;
+            fs::rename(&temporary, &manifest)?;
+            sync_dir(dir)?;
         }
-        if fs::metadata(&manifest)?.len() == 0 {
-            append(dir, &Edit { added: Vec::new(), removed: Vec::new(), next_file: 1, last_sequence: 0 })?;
-        }
-        let temporary = dir.join("CURRENT.tmp");
-        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
-        file.write_all(CURRENT.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temporary, &current)?;
-        sync_dir(dir)?;
     }
     let path = dir.join(NAME);
     let bytes = fs::read(&path)?;
@@ -75,6 +72,14 @@ pub fn open(dir: &Path) -> Result<Version, Error> {
         let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(position as u64)?;
         file.sync_all()?;
+    }
+    if !current_exists {
+        let temporary = dir.join("CURRENT.tmp");
+        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
+        file.write_all(CURRENT.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, &current)?;
+        sync_dir(dir)?;
     }
     Ok(version)
 }
@@ -119,7 +124,7 @@ fn apply(version: &mut Version, edit: Edit) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn append(dir: &Path, edit: &Edit) -> io::Result<()> {
+fn encode(edit: &Edit) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
     put_u32(&mut payload, 1);
     put_u64(&mut payload, edit.next_file);
@@ -136,6 +141,11 @@ pub fn append(dir: &Path, edit: &Edit) -> io::Result<()> {
     put_u32(&mut record, crc32c(&size.to_le_bytes()));
     put_u32(&mut record, crc32c(&payload));
     record.extend_from_slice(&payload);
+    Ok(record)
+}
+
+pub fn append(dir: &Path, edit: &Edit) -> io::Result<()> {
+    let record = encode(edit)?;
     let mut file = OpenOptions::new().append(true).open(dir.join(NAME))?;
     file.write_all(&record)?;
     file.sync_all()
@@ -184,5 +194,28 @@ mod tests {
         bytes[9] ^= 1;
         fs::write(path, bytes).unwrap();
         assert!(open(&dir.0).is_err());
+    }
+
+    #[test]
+    fn bootstrap_does_not_publish_current_for_an_invalid_manifest() {
+        let dir = TestDir::new();
+        let path = dir.0.join(NAME);
+        fs::write(&path, [1, 2, 3]).unwrap();
+        assert!(open(&dir.0).is_err());
+        assert!(!dir.0.join("CURRENT").exists());
+        assert_eq!(fs::read(&path).unwrap(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn bootstrap_recovers_from_temporary_files_and_republishes_current() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join("MANIFEST-000001.tmp"), b"partial").unwrap();
+        fs::write(dir.0.join("CURRENT.tmp"), b"partial").unwrap();
+        assert_eq!(open(&dir.0).unwrap().next_file, 1);
+        assert!(!dir.0.join("MANIFEST-000001.tmp").exists());
+        assert!(!dir.0.join("CURRENT.tmp").exists());
+        fs::remove_file(dir.0.join("CURRENT")).unwrap();
+        assert_eq!(open(&dir.0).unwrap().next_file, 1);
+        assert_eq!(fs::read(dir.0.join("CURRENT")).unwrap(), b"MANIFEST-000001\n");
     }
 }

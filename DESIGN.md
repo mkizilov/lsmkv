@@ -37,7 +37,9 @@ orphan cleanup is not yet implemented.
 ### Manifest
 
 `CURRENT` contains `MANIFEST-000001\n` and is published by syncing a temporary
-file, renaming it, and syncing the database directory. The manifest is an
+file, renaming it, and syncing the database directory. Initial manifest creation
+also uses a synced temporary file and rename; when `CURRENT` is missing, the
+manifest is validated before its pointer is published. The manifest is an
 append-only sequence of little-endian records: u32 payload length, u32 CRC32C
 of the encoded length, u32 CRC32C of the payload, then payload. Each version-1 payload contains u32 version, u64
 next file number, u64 last flushed sequence, u32 added count, u32 removed count,
