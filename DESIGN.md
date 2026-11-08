@@ -1,9 +1,20 @@
 # lsmkv design
 
-This document describes the intended engine, not functionality provided by the
-initial API stubs. Keys and values are arbitrary bytes, ordered lexicographically.
-The initial API returns a not-implemented error and does not create a database.
-The standalone B-tree memtable is implemented but is not yet connected to `Db`.
+Keys and values are arbitrary bytes, ordered lexicographically. The current
+`Db` uses a WAL and one B-tree memtable; SSTables, immutable memtables, the
+manifest, and compaction below describe the intended future engine.
+
+`Db::open` holds an exclusive OS advisory lock on the persistent `LOCK` file for
+the handle's lifetime. It replays complete `WAL` batches into a fresh memtable,
+requiring contiguous sequences starting at 1, truncates and syncs an invalid or
+torn tail to the last valid record, then opens the WAL for appending. The lock
+file is never unlinked, so a second process cannot accidentally lock a new
+inode. A mutex serializes reads and writes; each nonempty `WriteBatch` receives
+one sequence per mutation, is appended as a single WAL record, and is applied
+in full to the memtable only after append succeeds. An empty batch is a no-op.
+After a WAL append error, further writes require reopening: a failed write may
+still have reached disk and can appear after recovery. Scans return current live
+keys in sorted order. There is no concurrent snapshot API yet.
 
 ## Internal keys and storage
 
@@ -29,7 +40,7 @@ corresponding flush is durably recorded.
 
 ### WAL format and synchronization
 
-The standalone WAL is not yet connected to `Db`. All integers are little-endian.
+All integers are little-endian.
 Each record has a four-byte CRC32C (Castagnoli), a four-byte payload length, a
 one-byte record type (1 for batch), and the payload. The CRC covers the length,
 type, and payload, not the CRC field. Payloads are limited to 64 MiB and contain
@@ -45,8 +56,9 @@ The writer syncs each append or uses a worker to sync within the configured
 interval after the first unsynced append, even during inactivity. Interval-mode
 acknowledgement is not a durability guarantee; explicit `sync` or `close` waits
 for durability and reports worker errors. Close the writer explicitly to observe
-final errors; implicit drop reports errors to stderr. Directory synchronization,
-WAL rotation, and recovery orchestration remain future engine work.
+final errors; implicit drop reports errors to stderr. The database does not yet
+sync directory entries, so creation of a new directory or WAL is not guaranteed
+to survive a power failure; WAL rotation remains future engine work.
 
 Each SSTable contains sorted data blocks, a block index mapping key ranges to
 block locations, and bloom filters that can rule out a user key without reading

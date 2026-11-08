@@ -3,6 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::mem::size_of;
+use std::ops::RangeBounds;
 
 /// The operation represented by an internal key.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -56,6 +57,24 @@ pub trait Memtable {
 pub struct BTreeMemtable {
     entries: BTreeMap<InternalKey, Vec<u8>>,
     memory_usage: usize,
+}
+
+impl BTreeMemtable {
+    /// Return the newest live value for each key in the range.
+    pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Vec<crate::Entry> {
+        let mut result = Vec::new();
+        let mut previous: Option<&[u8]> = None;
+        for (key, value) in &self.entries {
+            if previous == Some(key.user_key.as_slice()) {
+                continue;
+            }
+            previous = Some(&key.user_key);
+            if key.kind == Kind::Put && range.contains(&key.user_key) {
+                result.push((key.user_key.clone(), value.clone()));
+            }
+        }
+        result
+    }
 }
 
 impl Memtable for BTreeMemtable {
