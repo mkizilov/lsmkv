@@ -6,6 +6,9 @@ use crate::encoding::{put_u32, put_u64, put_varint};
 use crate::memtable::{InternalKey, Kind};
 use crate::wal::crc32c;
 
+mod reader;
+pub use reader::{BlockCache, SstableIterator, SstableReader};
+
 const TARGET_BLOCK_SIZE: usize = 4096;
 const RESTART_INTERVAL: usize = 16;
 pub const FOOTER_MAGIC: u64 = 0x3156_4b4d_534c_5353;

@@ -29,17 +29,21 @@ pub enum Error {
     SequenceExhausted,
     #[error("invalid sequence order in WAL")]
     InvalidSequence,
+    #[error("SSTable corruption: {0}")]
+    Corruption(&'static str),
 }
 
 /// Database configuration. By default each write is synchronized to disk.
 #[derive(Debug, Clone)]
 pub struct Options {
     pub sync_policy: SyncPolicy,
+    /// Shared SSTable block-cache capacity in bytes; zero disables caching.
+    pub block_cache_capacity: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { sync_policy: SyncPolicy::EveryWrite }
+        Self { sync_policy: SyncPolicy::EveryWrite, block_cache_capacity: 8 * 1024 * 1024 }
     }
 }
 

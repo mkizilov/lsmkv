@@ -99,6 +99,23 @@ The footer has five u64 fields: filter offset, filter size, index offset, index
 size, and magic `0x31564b4d534c5353`. SSTables are not yet integrated into `Db`;
 the caller must flush/sync, atomically publish, and manage incomplete output.
 
+The standalone reader validates the complete file at open, including each block
+CRC, all restart entries, index key ordering, contiguous block layout, filter
+size, footer offsets, and magic. These constraints detect a single-byte change
+anywhere, including the footer, although the footer has no checksum and the
+format does not promise detection of coordinated multi-byte footer changes.
+Point lookups binary-search the index and restart keys, then scan within a
+restart interval; a seekable forward iterator uses the same ordering. Both APIs
+return exact internal keys and values, including tombstones, rather than applying
+snapshot visibility. SSTable files must remain immutable after opening.
+
+`BlockCache::new(&options)` uses `Options::block_cache_capacity` bytes (default
+8 MiB; zero disables caching); callers share it across readers with `Arc`.
+Cached block payload and decoded restart offsets count against that limit, not
+allocator overhead or blocks still referenced by active iterators after eviction.
+The cache is keyed by a unique reader identity and block offset and evicts least
+recently used blocks. It is not yet used by `Db`, which has no SSTables.
+
 ## Paths
 
 Writes assign a sequence number, append a Put or Delete to the WAL, honor the
