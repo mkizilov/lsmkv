@@ -1,6 +1,6 @@
 //! A WAL-backed, in-memory key-value database.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -95,6 +95,8 @@ pub struct Statistics {
     bytes_written_per_level: Mutex<BTreeMap<u32, u64>>,
     wal_group_commits: AtomicU64,
     committed_write_requests: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -105,6 +107,19 @@ pub struct Stats {
     pub write_amplification: f64,
     pub wal_group_commits: u64,
     pub committed_write_requests: u64,
+    pub files_per_level: BTreeMap<u32, usize>,
+    pub live_bytes_per_level: BTreeMap<u32, u64>,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_hit_rate: f64,
+}
+
+/// Files checked by an offline verification pass.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct VerifyReport {
+    pub wal_files: usize,
+    pub sstable_files: usize,
+    pub manifest_files: usize,
 }
 
 impl Statistics {
@@ -381,6 +396,13 @@ impl Db {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(Error::Locked),
             Err(error) => return Err(error.into()),
+        }
+        if !options.fs.exists(&path.join("CURRENT"))? && !options.fs.exists(&path.join("MANIFEST-000001"))? {
+            for existing in options.fs.read_dir(path)? {
+                if existing.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("SST-") && name.ends_with(".sst")) {
+                    return Err(Error::Corruption("SSTables exist without a manifest"));
+                }
+            }
         }
         let version = manifest::open(path, options.fs.as_ref())?;
         let cache = Arc::new(BlockCache::new(&options));
@@ -800,6 +822,20 @@ impl Db {
         };
         let logical = self.statistics.logical_bytes_written.load(Ordering::Relaxed);
         let written = levels.values().fold(0u64, |total, bytes| total.saturating_add(*bytes));
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(error) => { eprintln!("database mutex poisoned while collecting statistics"); error.into_inner() }
+        };
+        let mut files_per_level = BTreeMap::new();
+        let mut live_bytes_per_level = BTreeMap::new();
+        for (&level, files) in state.tables.iter() {
+            if files.is_empty() { continue; }
+            files_per_level.insert(level, files.len());
+            live_bytes_per_level.insert(level, files.iter().fold(0u64, |total, file| total.saturating_add(file.size)));
+        }
+        let cache_hits = self.statistics.cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self.statistics.cache_misses.load(Ordering::Relaxed);
+        let accesses = cache_hits.saturating_add(cache_misses);
         Stats {
             bloom_filter_block_reads_avoided: self.statistics.bloom_filter_block_reads_avoided.load(Ordering::Relaxed),
             logical_bytes_written: logical,
@@ -807,7 +843,54 @@ impl Db {
             write_amplification: if logical == 0 { 0.0 } else { written as f64 / logical as f64 },
             wal_group_commits: self.statistics.wal_group_commits.load(Ordering::Relaxed),
             committed_write_requests: self.statistics.committed_write_requests.load(Ordering::Relaxed),
+            files_per_level,
+            live_bytes_per_level,
+            cache_hits,
+            cache_misses,
+            cache_hit_rate: if accesses == 0 { 0.0 } else { cache_hits as f64 / accesses as f64 },
         }
+    }
+
+    /// Verify all recognized manifest, WAL, and SSTable checksums without recovery.
+    /// The database must be closed; verification takes its existing exclusive lock.
+    pub fn verify_path(path: impl AsRef<Path>, options: Options) -> Result<VerifyReport, Error> {
+        let dir = path.as_ref();
+        let fs = &options.fs;
+        let lock = fs.open(&dir.join("LOCK"), FileOptions::new().read(true).write(true))?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(Error::Locked),
+            Err(error) => return Err(error.into()),
+        }
+        let version = manifest::verify(dir, fs.as_ref())?;
+        let cache = Arc::new(BlockCache::new(&options));
+        let mut report = VerifyReport { manifest_files: 1, ..VerifyReport::default() };
+        let mut verified = BTreeSet::new();
+        for path in fs.read_dir(dir)? {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+            if name == "WAL" || numbered(name, "WAL-", "").is_some() {
+                let mut file = fs.open(&path, FileOptions::new().read(true))?;
+                let length = file.len()?;
+                let mut reader = WalReader::new(file.as_mut());
+                while reader.next_batch()?.is_some() {}
+                if reader.valid_bytes() != length { return Err(Error::Corruption("invalid WAL checksum or torn record")); }
+                report.wal_files += 1;
+            } else if name.starts_with("SST-") && name.ends_with(".sst") {
+                SstableReader::open(&path, Arc::clone(&cache))?;
+                verified.insert(path);
+                report.sstable_files += 1;
+            }
+        }
+        for &(_, number) in &version.files {
+            let path = flush::table_path(dir, number);
+            if !verified.contains(&path) {
+                if !fs.exists(&path)? { return Err(Error::Corruption("manifest references missing SSTable")); }
+                SstableReader::open(&path, Arc::clone(&cache))?;
+                report.sstable_files += 1;
+            }
+        }
+        drop(lock);
+        Ok(report)
     }
 }
 
@@ -856,7 +939,9 @@ impl Drop for Db {
                 Err(error) => { eprintln!("database mutex poisoned while closing"); error.into_inner().0 }
             };
         }
-        let _ = state.notify.send(MaintenanceSignal::Stop);
+        if state.notify.send(MaintenanceSignal::Stop).is_err() {
+            eprintln!("maintenance coordinator stopped before database close");
+        }
         drop(state);
         if let Some(handle) = self.coordinator.take() {
             if handle.join().is_err() { eprintln!("maintenance thread panicked"); }
@@ -948,6 +1033,9 @@ fn recover(
                     apply(&mut table, operation);
                 }
             }
+        }
+        if reader.stop_reason() == Some(wal::StopReason::Corrupt) {
+            return Err(Error::Corruption("corrupt WAL record"));
         }
         let valid = reader.valid_bytes();
         if valid != file.len()? {

@@ -48,8 +48,11 @@ impl BlockCache {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let block = state.blocks.get(&key).cloned();
         if block.is_some() {
+            self.statistics.cache_hits.fetch_add(1, Ordering::Relaxed);
             state.order.retain(|item| *item != key);
             state.order.push_back(key);
+        } else {
+            self.statistics.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
         Ok(block)
     }

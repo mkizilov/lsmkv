@@ -65,6 +65,15 @@ pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
     Ok(version)
 }
 
+/// Check the current manifest without creating or truncating files.
+pub fn verify(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
+    if fs.read(&dir.join("CURRENT"))? != CURRENT.as_bytes() { return Err(Error::Corruption("CURRENT")); }
+    let bytes = fs.read(&dir.join(NAME))?;
+    let (version, valid) = parse_records(&bytes)?;
+    if valid != bytes.len() { return Err(Error::Corruption("torn manifest record")); }
+    Ok(version)
+}
+
 fn parse_records(bytes: &[u8]) -> Result<(Version, usize), Error> {
     let mut position = 0usize;
     let mut version = Version::default();

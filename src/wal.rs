@@ -175,7 +175,7 @@ fn run_writer(mut file: Box<dyn FsFile>, policy: SyncPolicy, receiver: Receiver<
                 let result = if let Some((kind, message)) = &failure {
                     Err(io::Error::new(*kind, message.clone()))
                 } else if dirty {
-                    file.sync_all()
+                    file.sync_all().map(|()| dirty = false)
                 } else { Ok(()) };
                 (result, reply, true)
             }
@@ -185,6 +185,9 @@ fn run_writer(mut file: Box<dyn FsFile>, policy: SyncPolicy, receiver: Receiver<
         }
         let _ = reply.send(result);
         if close { break; }
+    }
+    if dirty {
+        if let Err(error) = file.sync_all() { eprintln!("failed to sync disconnected WAL: {error}"); }
     }
 }
 
@@ -273,43 +276,53 @@ pub(crate) fn fuzz_payload(bytes: &[u8]) -> Result<(), crate::Error> {
 }
 
 /// Sequential reader that stops at the first invalid or incomplete record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopReason {
+    Eof,
+    Torn,
+    Corrupt,
+}
+
 pub struct WalReader<R> {
     input: R,
     valid_bytes: u64,
     stopped: bool,
+    reason: Option<StopReason>,
 }
 
 impl<R: Read> WalReader<R> {
     pub fn new(input: R) -> Self {
-        Self { input, valid_bytes: 0, stopped: false }
+        Self { input, valid_bytes: 0, stopped: false, reason: None }
     }
 
     pub fn valid_bytes(&self) -> u64 {
         self.valid_bytes
     }
 
+    pub fn stop_reason(&self) -> Option<StopReason> { self.reason }
+
     pub fn next_batch(&mut self) -> io::Result<Option<Vec<Operation>>> {
         if self.stopped { return Ok(None); }
         self.stopped = true;
         let mut header = [0u8; 9];
-        if !read_complete(&mut self.input, &mut header)? {
-            self.stopped = true;
+        if let Some(reason) = read_header(&mut self.input, &mut header)? {
+            self.reason = Some(reason);
             return Ok(None);
         }
         let checksum = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if length > MAX_PAYLOAD || header[8] != BATCH_TYPE {
-            self.stopped = true;
+            self.reason = Some(StopReason::Corrupt);
             return Ok(None);
         }
         let Some(payload) = read_payload(&mut self.input, length)? else {
-            self.stopped = true;
+            self.reason = Some(StopReason::Torn);
             return Ok(None);
         };
         let checksum_actual = !crc32c_extend(crc32c_extend(!0u32, &header[4..]), &payload);
         let batch = if checksum_actual == checksum { decode(&payload) } else { None };
         if batch.is_none() {
-            self.stopped = true;
+            self.reason = Some(StopReason::Corrupt);
             return Ok(None);
         }
         self.valid_bytes += 9 + length as u64;
@@ -336,17 +349,23 @@ fn read_payload(reader: &mut impl Read, length: usize) -> io::Result<Option<Vec<
     Ok(Some(payload))
 }
 
-fn read_complete(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
-    match reader.read_exact(buffer) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error),
+fn read_header(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<Option<StopReason>> {
+    let mut read = 0;
+    while read < buffer.len() {
+        match reader.read(&mut buffer[read..]) {
+            Ok(0) => return Ok(Some(if read == 0 { StopReason::Eof } else { StopReason::Torn })),
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Some(StopReason::Torn)),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, crc32c_extend, decode, Operation, SyncPolicy, WalReader, WalWriter};
+    use super::{crc32c, crc32c_extend, decode, Operation, StopReason, SyncPolicy, WalReader, WalWriter};
     use std::fs::{self, File};
     use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
@@ -381,6 +400,7 @@ mod tests {
         assert_eq!(!crc32c_extend(crc32c_extend(!0, b"1234"), b"56789"), 0xe3069283);
         let mut reader = WalReader::new(Cursor::new(Vec::<u8>::new()));
         assert_eq!(reader.next_batch().unwrap(), None);
+        assert_eq!(reader.stop_reason(), Some(StopReason::Eof));
         assert_eq!(reader.valid_bytes(), 0);
         assert_eq!(reader.next_batch().unwrap(), None);
     }
@@ -400,6 +420,7 @@ mod tests {
         let mut reader = WalReader::new(Limited(Cursor::new(header)));
         assert_eq!(reader.next_batch().unwrap(), None);
         assert_eq!(reader.valid_bytes(), 0);
+        assert_eq!(reader.stop_reason(), Some(StopReason::Torn));
     }
 
     #[test]
@@ -473,6 +494,7 @@ mod tests {
         assert_eq!(reader.next_batch().unwrap(), Some(batch(1)));
         assert_eq!(reader.next_batch().unwrap(), None);
         assert_eq!(reader.valid_bytes(), first_length);
+        assert_eq!(reader.stop_reason(), Some(StopReason::Corrupt));
         assert_eq!(reader.next_batch().unwrap(), None);
         File::create(&path.0).unwrap().write_all(&damaged).unwrap();
         assert!(WalWriter::open(&path.0, SyncPolicy::EveryWrite).is_err());

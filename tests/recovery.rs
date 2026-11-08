@@ -110,3 +110,29 @@ fn rejects_nonmonotonic_wal_sequences() {
     assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::InvalidSequence)));
     assert!(OpenOptions::new().read(true).open(path).unwrap().metadata().unwrap().len() > 0);
 }
+
+#[test]
+fn checksum_corruption_is_not_silently_truncated() {
+    let dir = TestDir::new();
+    {
+        let db = Db::open(&dir.0, Options::default()).unwrap();
+        db.put(b"first", b"value").unwrap();
+        db.put(b"second", b"value").unwrap();
+    }
+    let path = dir.0.join("WAL");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[10] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Corruption("corrupt WAL record"))));
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn orphan_tables_without_manifest_do_not_create_an_empty_database() {
+    let dir = TestDir::new();
+    let orphan = dir.0.join("SST-00000000000000000001.sst");
+    fs::write(&orphan, b"unknown table").unwrap();
+    assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Corruption("SSTables exist without a manifest"))));
+    assert_eq!(fs::read(orphan).unwrap(), b"unknown table");
+    assert!(!dir.0.join("CURRENT").exists());
+}
