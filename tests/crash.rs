@@ -85,7 +85,7 @@ fn sigkill_recovery_preserves_acknowledged_prefix_for_200_crashes() {
                     Ok(0) => break,
                     Ok(_) if bytes.last() != Some(&b'\n') => break,
                     Ok(_) => {
-                        bytes.pop();
+                        bytes.truncate(bytes.len() - 1);
                         match String::from_utf8(bytes) {
                             Ok(line) => { if send.send(line).is_err() { break; } }
                             Err(error) => { let _ = send.send(format!("LSMKV_PIPE_ERROR {error}")); break; }

@@ -87,7 +87,7 @@ impl Dataset {
         }
         let dir = OwnedDir::new()?;
         let db = Db::open(&dir.0, Options::default())?;
-        let mut first = 0;
+        let mut first: u64 = 0;
         while first < keys {
             let end = first.saturating_add(1000).min(keys);
             let mut batch = WriteBatch::new();

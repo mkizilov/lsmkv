@@ -38,7 +38,8 @@ The manifest publishes live files after their contents are synced.
 Arguments are UTF-8 text; the library API supports arbitrary bytes. `get` writes
 the raw value followed by a newline and exits nonzero when absent. `scan` prints
 hexadecimal key and value pairs separated by a tab, one per line; START is
-inclusive and END is exclusive. Only `put` creates a missing database.
+inclusive and END is exclusive. Among key-value commands, only `put` creates a
+missing database.
 
 ```sh
 cargo run --bin lsmkv-cli -- put .agent-local/example-db greeting hello
@@ -93,6 +94,9 @@ little-endian except user-supplied bytes. See `DESIGN.md` for exact layouts.
 - This implementation, its crash harness and fuzzers have not been validated in
   the current sandbox because Cargo is unavailable. Do not treat it as a
   production durability guarantee until the full checks have passed.
+- Neither the property and concurrency tests nor the 200-iteration crash test
+  have run here. The fuzz targets ran for zero minutes, and the million-key
+  workloads have no measured results or verified optimization.
 
 ## Verification and performance
 
@@ -112,3 +116,5 @@ cargo run --release --bin lsmkv-cli -- bench --seconds 60 --keys 1000000
 The crash test performs 200 SIGKILL/recovery iterations on Unix. Fuzz setup,
 bounded runs, and regression procedures are in `FUZZING.md`; benchmark setup,
 machine details, and the absence of measured results are in `BENCHMARKS.md`.
+The prioritized handoff, verification gaps, and effort estimates are in
+`ROADMAP.md`.
