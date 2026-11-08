@@ -1,13 +1,14 @@
 # lsmkv design
 
 Keys and values are arbitrary bytes, ordered lexicographically. The current
-`Db` uses a WAL and one B-tree memtable; SSTables, immutable memtables, the
-manifest, and compaction below describe the intended future engine.
+`Db` uses a WAL, B-tree memtables, and level-0 SSTables tracked in a manifest.
+Compaction and deeper levels below describe the intended future engine.
 
 `Db::open` holds an exclusive OS advisory lock on the persistent `LOCK` file for
-the handle's lifetime. It replays complete `WAL` batches into a fresh memtable,
-requiring contiguous sequences starting at 1, truncates and syncs an invalid or
-torn tail to the last valid record, then opens the WAL for appending. The lock
+the handle's lifetime. It loads the manifest and its SSTables, then replays WAL
+batches newer than the manifest's last flushed sequence into a fresh memtable,
+requiring contiguous sequences and truncating a torn WAL tail to the last valid
+record. It resumes appending to the latest WAL. The lock
 file is never unlinked, so a second process cannot accidentally lock a new
 inode. A mutex serializes reads and writes; each nonempty `WriteBatch` receives
 one sequence per mutation, is appended as a single WAL record, and is applied
@@ -15,6 +16,35 @@ in full to the memtable only after append succeeds. An empty batch is a no-op.
 After a WAL append error, further writes require reopening: a failed write may
 still have reached disk and can appear after recovery. Scans return current live
 keys in sorted order. There is no concurrent snapshot API yet.
+
+When a batch takes the mutable memtable over `Options::memtable_size` (default
+4 MiB), the database syncs its old WAL, creates and syncs a new numbered WAL,
+then freezes the old memtable and flushes it on a background thread. At most one
+flush is in flight; a subsequent rotation waits for it. Reads see the mutable
+memtable, the frozen memtable, and live level-0 tables in newest-first order.
+`sync` and database drop wait for pending flushes. A failed flush stops further
+writes and retains the frozen table for recovery.
+
+The worker writes a new SSTable to a temporary file, syncs it, renames it to
+its final name and syncs the directory. It then appends and syncs a manifest edit
+that adds the level-0 file and advances the flushed sequence, and only afterward
+deletes the WALs covered by that edit. Recovery ignores orphan SSTables that
+were not added to the manifest, replays their still-live WALs, and skips stale
+WAL records already covered by the manifest. File numbers are advanced past all
+existing numbered WALs and SSTables, including orphan and temporary SSTables;
+orphan cleanup is not yet implemented.
+
+### Manifest
+
+`CURRENT` contains `MANIFEST-000001\n` and is published by syncing a temporary
+file, renaming it, and syncing the database directory. The manifest is an
+append-only sequence of little-endian records: u32 payload length, u32 CRC32C
+of the encoded length, u32 CRC32C of the payload, then payload. Each version-1 payload contains u32 version, u64
+next file number, u64 last flushed sequence, u32 added count, u32 removed count,
+then added and removed entries respectively, each `(level:u32, file:u64)`.
+Complete edits with bad checksums are rejected; a truncated final edit is
+discarded and truncated. File additions/removals are applied in order. This
+implementation creates level-0 files only and rejects other live levels.
 
 ## Internal keys and storage
 
@@ -56,9 +86,9 @@ The writer syncs each append or uses a worker to sync within the configured
 interval after the first unsynced append, even during inactivity. Interval-mode
 acknowledgement is not a durability guarantee; explicit `sync` or `close` waits
 for durability and reports worker errors. Close the writer explicitly to observe
-final errors; implicit drop reports errors to stderr. The database does not yet
-sync directory entries, so creation of a new directory or WAL is not guaranteed
-to survive a power failure; WAL rotation remains future engine work.
+final errors; implicit drop reports errors to stderr. The database syncs directory
+entries when publishing a new WAL, SSTable, or CURRENT file; durability of the
+database directory's own creation in its parent is not yet guaranteed.
 
 Each SSTable contains sorted data blocks, a block index mapping key ranges to
 block locations, and bloom filters that can rule out a user key without reading
@@ -111,8 +141,8 @@ The index payload begins with a u32 block count followed by one entry per data
 block: `key_len:varint, last_encoded_key, offset:u64, size:u64`. Offsets are
 absolute from the start of the SSTable and the index follows data-block order.
 The footer has five u64 fields: filter offset, filter size, index offset, index
-size, and magic `0x31564b4d534c5353`. SSTables are not yet integrated into `Db`;
-the caller must flush/sync, atomically publish, and manage incomplete output.
+size, and magic `0x31564b4d534c5353`. The standalone writer's caller must
+flush/sync, atomically publish, and manage incomplete output.
 
 The standalone reader validates the complete file at open, including each block
 CRC, all restart entries, index key ordering, contiguous block layout, filter
@@ -134,8 +164,8 @@ block; iterator seeks do not use the filter. `Db::stats()` exposes the shared
 `bloom_filter_block_reads_avoided` counter: it increments when a negative filter
 result eliminates an uncached candidate block read, excluding validation reads
 at open. Cloning the same `Options` into `Db` and the shared `BlockCache` shares
-this counter; it is an estimate under concurrent cache changes. The cache and
-filters are not yet used by `Db` itself, which has no SSTables.
+this counter; it is an estimate under concurrent cache changes. `Db` uses one
+shared cache and the per-table filters for its level-0 point reads.
 
 ## Paths
 

@@ -60,6 +60,10 @@ pub struct BTreeMemtable {
 }
 
 impl BTreeMemtable {
+    pub fn entries(&self) -> impl Iterator<Item = (&InternalKey, &Vec<u8>)> {
+        self.entries.iter()
+    }
+
     /// Return the newest live value for each key in the range.
     pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Vec<crate::Entry> {
         let mut result = Vec::new();

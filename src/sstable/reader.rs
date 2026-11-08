@@ -210,14 +210,7 @@ impl SstableReader {
 
     /// Find an exact internal key using the index and restart-point binary searches.
     pub fn get(&self, target: &InternalKey) -> Result<Option<Vec<u8>>, Error> {
-        let number = self.index.partition_point(|entry| entry.last < *target);
-        let Some(entry) = self.index.get(number) else { return Ok(None); };
-        if self.filter.as_ref().is_some_and(|filter| !filter.may_contain(&target.user_key)) {
-            if !self.cache.contains((self.id, entry.offset))? {
-                self.cache.statistics.bloom_filter_block_reads_avoided.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(None);
-        }
+        if !self.may_read(target)? { return Ok(None); }
         let mut iterator = self.iter();
         iterator.seek(target)?;
         match iterator.next() {
@@ -225,6 +218,31 @@ impl SstableReader {
             Some(Err(error)) => Err(error),
             _ => Ok(None),
         }
+    }
+
+    /// Find the newest internal version for a user key, including tombstones.
+    pub fn get_user(&self, user_key: &[u8]) -> Result<Option<(Kind, Vec<u8>)>, Error> {
+        let target = InternalKey::new(user_key.to_vec(), u64::MAX, Kind::Put);
+        if !self.may_read(&target)? { return Ok(None); }
+        let mut iterator = self.iter();
+        iterator.seek(&target)?;
+        match iterator.next() {
+            Some(Ok((key, value))) if key.user_key == user_key => Ok(Some((key.kind, value))),
+            Some(Err(error)) => Err(error),
+            _ => Ok(None),
+        }
+    }
+
+    fn may_read(&self, target: &InternalKey) -> Result<bool, Error> {
+        let number = self.index.partition_point(|entry| entry.last < *target);
+        let Some(entry) = self.index.get(number) else { return Ok(false); };
+        if self.filter.as_ref().is_some_and(|filter| !filter.may_contain(&target.user_key)) {
+            if !self.cache.contains((self.id, entry.offset))? {
+                self.cache.statistics.bloom_filter_block_reads_avoided.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub fn iter(&self) -> SstableIterator<'_> {
