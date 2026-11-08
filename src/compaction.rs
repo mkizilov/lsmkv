@@ -2,12 +2,12 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::flush::table_path;
+use crate::fs::{FileOptions, FsFile};
 use crate::manifest::{self, Edit};
 use crate::memtable::{InternalKey, Kind};
 use crate::merge::Source;
@@ -66,13 +66,13 @@ pub fn run(job: Job) -> Result<Output, Error> {
     }
     emit_group(&job, &mut group, &mut chunk, &mut estimate, &mut files, &mut next_file)?;
     if !chunk.is_empty() { write_chunk(&job, &mut chunk, &mut files, &mut next_file)?; }
-    manifest::sync_dir(&job.dir)?;
+    manifest::sync_dir(&job.dir, job.options.fs.as_ref())?;
     manifest::append(&job.dir, &Edit {
         added: files.iter().map(|file| (job.level, file.number)).collect(),
         removed: job.removed.clone(),
         next_file,
         last_sequence: job.last_sequence,
-    })?;
+    }, job.options.fs.as_ref())?;
     Ok(Output { level: job.level, files, removed: job.removed, next_file })
 }
 
@@ -123,26 +123,28 @@ fn write_chunk(job: &Job, chunk: &mut Vec<(InternalKey, Vec<u8>)>, files: &mut V
     *next_file = next_file.checked_add(1).ok_or(Error::SequenceExhausted)?;
     let temporary = job.dir.join(format!("SST-{number:020}.tmp"));
     let path = table_path(&job.dir, number);
-    let file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    let file = job.options.fs.open(&temporary, FileOptions::new().write(true).create_new(true))?;
     let result = write_output(job, file, &temporary, &path, number, chunk);
-    if result.is_err() && temporary.exists() {
-        if let Err(error) = fs::remove_file(&temporary) { eprintln!("failed to remove incomplete compaction output: {error}"); }
+    if result.is_err() {
+        if let Err(error) = job.options.fs.remove_file(&temporary) {
+            if error.kind() != std::io::ErrorKind::NotFound { eprintln!("failed to remove incomplete compaction output: {error}"); }
+        }
     }
     files.push(result?);
     chunk.clear();
     Ok(())
 }
 
-fn write_output(job: &Job, file: fs::File, temporary: &Path, path: &Path, number: u64, chunk: &[(InternalKey, Vec<u8>)]) -> Result<Arc<Table>, Error> {
+fn write_output(job: &Job, file: Box<dyn FsFile>, temporary: &Path, path: &Path, number: u64, chunk: &[(InternalKey, Vec<u8>)]) -> Result<Arc<Table>, Error> {
     let mut writer = SstableWriter::with_options(file, &job.options)?;
     for (key, value) in chunk { writer.add(key, value)?; }
     let file = writer.finish()?;
     file.sync_all()?;
-    let size = file.metadata()?.len();
+    let size = file.len()?;
     job.options.statistics.record_level(job.level, size)?;
-    fs::rename(temporary, path)?;
+    job.options.fs.rename(temporary, path)?;
     let reader = SstableReader::open(path, Arc::clone(&job.cache))?;
-    Ok(Arc::new(Table { reader, number, path: path.to_path_buf(), size, obsolete: AtomicBool::new(false) }))
+    Ok(Arc::new(Table { reader, number, path: path.to_path_buf(), size, obsolete: AtomicBool::new(false), fs: Arc::clone(&job.options.fs) }))
 }
 
 #[cfg(test)]

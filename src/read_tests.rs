@@ -44,7 +44,7 @@ fn reads_and_merges_versions_across_levels() {
     write_table(&dir, 2, vec![(key(b"x", 3, Kind::Put), b"deep-x".to_vec()), (key(b"z", 4, Kind::Put), b"deep-z".to_vec())]);
     write_table(&dir, 3, vec![(key(b"a", 5, Kind::Put), b"middle-a".to_vec()), (key(b"b", 6, Kind::Delete), Vec::new())]);
     write_table(&dir, 4, vec![(key(b"a", 7, Kind::Put), b"new-a".to_vec()), (key(b"c", 8, Kind::Put), b"new-c".to_vec()), (key(b"x", 9, Kind::Delete), Vec::new())]);
-    manifest::append(&dir.0, &Edit { added: vec![(2, 2), (2, 1), (1, 3), (0, 4)], removed: Vec::new(), next_file: 5, last_sequence: 9 }).unwrap();
+    manifest::append(&dir.0, &Edit { added: vec![(2, 2), (2, 1), (1, 3), (0, 4)], removed: Vec::new(), next_file: 5, last_sequence: 9 }, &crate::fs::NativeFs).unwrap();
     let db = Db::open(&dir.0, Options::default()).unwrap();
     assert_eq!(db.get(b"a").unwrap(), Some(b"new-a".to_vec()));
     assert_eq!(db.get(b"b").unwrap(), None);
@@ -73,7 +73,7 @@ fn overlapping_deeper_level_ranges_are_rejected() {
     drop(Db::open(&dir.0, Options::default()).unwrap());
     write_table(&dir, 1, vec![(key(b"a", 1, Kind::Put), b"a".to_vec()), (key(b"c", 2, Kind::Put), b"c".to_vec())]);
     write_table(&dir, 2, vec![(key(b"b", 3, Kind::Put), b"b".to_vec())]);
-    manifest::append(&dir.0, &Edit { added: vec![(1, 1), (1, 2)], removed: Vec::new(), next_file: 3, last_sequence: 3 }).unwrap();
+    manifest::append(&dir.0, &Edit { added: vec![(1, 1), (1, 2)], removed: Vec::new(), next_file: 3, last_sequence: 3 }, &crate::fs::NativeFs).unwrap();
     assert!(matches!(Db::open(&dir.0, Options::default()), Err(Error::Corruption("overlapping table ranges"))));
 }
 

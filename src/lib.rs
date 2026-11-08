@@ -1,6 +1,5 @@
 //! A WAL-backed, in-memory key-value database.
 
-use std::fs::{self, File, OpenOptions};
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::ops::RangeBounds;
@@ -12,7 +11,7 @@ use std::ops::Deref;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fs2::FileExt;
+use fs::{FileOptions, Fs, FsFile};
 use memtable::{BTreeMemtable, InternalKey, Kind, Lookup, Memtable};
 use sstable::{BlockCache, SstableReader};
 use wal::{Operation, SyncPolicy, WalReader, WalWriter};
@@ -21,6 +20,7 @@ pub mod memtable;
 pub mod encoding;
 pub mod sstable;
 pub mod wal;
+pub mod fs;
 mod manifest;
 mod flush;
 mod merge;
@@ -64,6 +64,8 @@ pub struct Options {
     pub target_file_size: u64,
     /// Counters shared by database and SSTable readers using these options.
     pub statistics: Arc<Statistics>,
+    /// Filesystem used by all database storage operations.
+    pub fs: Arc<dyn fs::Fs>,
 }
 
 impl Default for Options {
@@ -77,6 +79,7 @@ impl Default for Options {
             l0_stop_writes_trigger: 12,
             target_file_size: 2 * 1024 * 1024,
             statistics: Arc::new(Statistics::default()),
+            fs: Arc::new(fs::NativeFs),
         }
     }
 }
@@ -116,6 +119,7 @@ struct Table {
     path: PathBuf,
     size: u64,
     obsolete: AtomicBool,
+    fs: Arc<dyn Fs>,
 }
 
 impl Deref for Table {
@@ -126,7 +130,7 @@ impl Deref for Table {
 impl Drop for Table {
     fn drop(&mut self) {
         if self.obsolete.load(Ordering::Acquire) {
-            if let Err(error) = fs::remove_file(&self.path) {
+            if let Err(error) = self.fs.remove_file(&self.path) {
                 eprintln!("failed to remove obsolete SSTable {}: {error}", self.path.display());
             }
         }
@@ -271,7 +275,7 @@ impl State {
                 let output = handle.join().map_err(|_| io::Error::other("flush thread panicked"))??;
                 let path = flush::table_path(&self.dir, number);
                 Arc::make_mut(&mut self.tables).entry(0).or_default().push(Arc::new(Table {
-                    reader: output.reader, number, path, size: output.size, obsolete: AtomicBool::new(false),
+                    reader: output.reader, number, path, size: output.size, obsolete: AtomicBool::new(false), fs: Arc::clone(&self.options.fs),
                 }));
                 self.flushed_sequence = sequence;
                 Ok((Vec::new(), self.frozen.take()))
@@ -335,7 +339,7 @@ impl State {
 /// A database handle. Dropping it closes the WAL before releasing the lock.
 pub struct Db {
     state: Arc<Mutex<State>>,
-    _lock: File,
+    _lock: Box<dyn FsFile>,
     statistics: Arc<Statistics>,
     coordinator: Option<JoinHandle<()>>,
     maintenance_cv: Arc<Condvar>,
@@ -368,22 +372,21 @@ impl Db {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid compaction settings").into());
         }
         let path = path.as_ref();
-        fs::create_dir_all(path)?;
-        let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
-            .open(path.join("LOCK"))?;
+        options.fs.create_dir_all(path)?;
+        let lock = options.fs.open(&path.join("LOCK"), FileOptions::new().read(true).write(true).create(true).truncate(false))?;
         match lock.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(Error::Locked),
             Err(error) => return Err(error.into()),
         }
-        let version = manifest::open(path)?;
+        let version = manifest::open(path, options.fs.as_ref())?;
         let cache = Arc::new(BlockCache::new(&options));
         let mut tables: TableVersion = BTreeMap::new();
         for &(level, number) in &version.files {
             let table_path = flush::table_path(path, number);
-            let size = fs::metadata(&table_path)?.len();
+            let size = options.fs.len(&table_path)?;
             let reader = SstableReader::open(&table_path, Arc::clone(&cache))?;
-            let table = Arc::new(Table { reader, number, path: table_path, size, obsolete: AtomicBool::new(false) });
+            let table = Arc::new(Table { reader, number, path: table_path, size, obsolete: AtomicBool::new(false), fs: Arc::clone(&options.fs) });
             if level != 0 && table.user_key_bounds().is_none() {
                 return Err(Error::Corruption("empty deeper-level table"));
             }
@@ -398,7 +401,7 @@ impl Db {
                 if previous_last >= next_first { return Err(Error::Corruption("overlapping table ranges")); }
             }
         }
-        let (table, wal_paths, wal, next_sequence, next_file) = recover(path, &version, options.sync_policy)?;
+        let (table, wal_paths, wal, next_sequence, next_file) = recover(path, &version, options.sync_policy, Arc::clone(&options.fs))?;
         let (notify, receiver) = mpsc::channel();
         let maintenance_cv = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(State {
@@ -654,15 +657,16 @@ impl Db {
         let path = flush::wal_path(&state.dir, wal_number);
         let dir = state.dir.clone();
         let policy = state.options.sync_policy;
+        let fs = Arc::clone(&state.options.fs);
         let old = Arc::clone(&state.wal);
         state.rotating = true;
         drop(state);
         let prepared: Result<Arc<WalWriter>, Error> = (|| {
             old.sync()?;
-            let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+            let file = fs.open(&path, FileOptions::new().write(true).create_new(true))?;
             file.sync_all()?;
-            manifest::sync_dir(&dir)?;
-            Ok(Arc::new(WalWriter::open(&path, policy)?))
+            manifest::sync_dir(&dir, fs.as_ref())?;
+            Ok(Arc::new(WalWriter::open_with_fs(&path, policy, Arc::clone(&fs))?))
         })();
         let mut state = self.state()?;
         let result = prepared.and_then(|wal| state.install_rotation(wal, path, table_number, next_file));
@@ -886,19 +890,18 @@ fn recover(
     dir: &Path,
     version: &manifest::Version,
     policy: SyncPolicy,
+    fs: Arc<dyn Fs>,
 ) -> Result<(BTreeMemtable, Vec<PathBuf>, WalWriter, u64, u64), Error> {
     let mut paths = Vec::new();
     let mut max_number = version.next_file - 1;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for path in fs.read_dir(dir)? {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
         if name == "WAL" {
-            paths.push((0, entry.path()));
+            paths.push((0, path));
         } else if let Some(number) = numbered(name, "WAL-", "") {
             if number == 0 { return Err(Error::Corruption("invalid WAL number")); }
             max_number = max_number.max(number);
-            paths.push((number, entry.path()));
+            paths.push((number, path));
         } else if let Some(number) = numbered(name, "SST-", ".sst")
             .or_else(|| numbered(name, "SST-", ".tmp")) {
             max_number = max_number.max(number);
@@ -912,16 +915,16 @@ fn recover(
             next_file = next_file.checked_add(1).ok_or(Error::SequenceExhausted)?;
             path
         };
-        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let file = fs.open(&path, FileOptions::new().write(true).create_new(true))?;
         file.sync_all()?;
-        manifest::sync_dir(dir)?;
+        manifest::sync_dir(dir, fs.as_ref())?;
         paths.push((0, path));
     }
     let mut table = BTreeMemtable::default();
     let mut next_sequence = version.last_sequence.checked_add(1).ok_or(Error::SequenceExhausted)?;
     for (_, path) in &paths {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut reader = WalReader::new(&file);
+        let mut file = fs.open(path, FileOptions::new().read(true).write(true))?;
+        let mut reader = WalReader::new(file.as_mut());
         while let Some(batch) = reader.next_batch()? {
             let mut previous = None;
             let mut older = None;
@@ -944,14 +947,14 @@ fn recover(
             }
         }
         let valid = reader.valid_bytes();
-        if valid != file.metadata()?.len() {
+        if valid != file.len()? {
             file.set_len(valid)?;
             file.sync_all()?;
         }
     }
     let wal_paths: Vec<PathBuf> = paths.into_iter().map(|(_, path)| path).collect();
     let active = wal_paths.last().ok_or(Error::Corruption("missing WAL"))?;
-    let wal = WalWriter::open(active, policy)?;
+    let wal = WalWriter::open_with_fs(active, policy, fs)?;
     Ok((table, wal_paths, wal, next_sequence, next_file))
 }
 

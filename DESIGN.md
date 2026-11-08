@@ -115,6 +115,25 @@ key/value bytes accepted by WAL writes, and their ratio as write amplification.
 The ratio excludes WAL and manifest bytes, and is zero if no logical bytes have
 been written. Statistics are shared via `Options` and are not persisted.
 
+### Filesystem and crash testing
+
+`Options::fs` selects an `Arc<dyn Fs>`; the default `NativeFs` delegates to the
+operating system. Database directory operations, lock acquisition, WAL and
+manifest reads/writes, SSTable I/O, sync, rename, truncation and deletion all go
+through this boundary. `FsFile` provides read/write/seek, metadata length,
+truncate, sync, and exclusive lock operations. The standalone WAL writer defaults
+to `NativeFs` and also offers `open_with_fs`; standalone SSTable readers use the
+filesystem supplied to their shared block cache.
+
+`tests/crash.rs` launches a child that syncs each deterministic write and sends
+acknowledgements over stdout. Its parent uses reproducible pseudo-random kill
+points, sends SIGKILL, drains complete pipe messages, and checks the recovered
+prefix for 200 iterations. `tests/faults.rs` supplies an injectable filesystem
+that can fail or tear writes, truncate a file, or fail fsync; it checks WAL,
+SSTable, and manifest failure recovery. Run `cargo test --test crash` and
+`cargo test --test faults` in addition to `scripts/check.sh`. These checks have
+not been run in this environment because Cargo is unavailable.
+
 ## Internal keys and storage
 
 Each mutation has an internal key `(user key, sequence number, kind)`, where

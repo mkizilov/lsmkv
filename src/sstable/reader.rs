@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::encoding::{get_u32, get_u64, get_varint};
+use crate::fs::{FileOptions, Fs, FsFile};
 use crate::memtable::{InternalKey, Kind};
 use crate::wal::crc32c;
 use crate::{Error, Options, Statistics};
@@ -27,6 +27,7 @@ pub struct BlockCache {
     capacity: usize,
     state: Mutex<CacheState>,
     statistics: Arc<Statistics>,
+    fs: Arc<dyn Fs>,
 }
 
 impl BlockCache {
@@ -35,6 +36,7 @@ impl BlockCache {
             capacity: options.block_cache_capacity,
             state: Mutex::new(CacheState { blocks: HashMap::new(), order: VecDeque::new(), bytes: 0 }),
             statistics: Arc::clone(&options.statistics),
+            fs: Arc::clone(&options.fs),
         }
     }
 
@@ -125,7 +127,7 @@ impl Block {
 
 /// An immutable SSTable; its underlying file must not be modified after opening.
 pub struct SstableReader {
-    file: Mutex<File>,
+    file: Mutex<Box<dyn FsFile>>,
     index: Vec<IndexEntry>,
     cache: Arc<BlockCache>,
     id: u64,
@@ -137,13 +139,13 @@ pub struct SstableReader {
 impl SstableReader {
     /// Validate the complete file, then load its index. Share `cache` among tables.
     pub fn open(path: impl AsRef<Path>, cache: Arc<BlockCache>) -> Result<Self, Error> {
-        let mut file = File::open(path)?;
-        let file_len = file.metadata()?.len();
+        let mut file = cache.fs.open(path.as_ref(), FileOptions::new().read(true))?;
+        let file_len = file.len()?;
         if file_len < 48 { return Err(Error::Corruption("short footer")); }
         let footer_start = file_len - 40;
         file.seek(SeekFrom::Start(footer_start))?;
         let mut footer = [0; 40];
-        read_exact(&mut file, &mut footer)?;
+        read_exact(file.as_mut(), &mut footer)?;
         let mut f = &footer[..];
         let filter_offset = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
         let filter_size = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
@@ -154,9 +156,9 @@ impl SstableReader {
             || index_offset.checked_add(index_size) != Some(footer_start) {
             return Err(Error::Corruption("footer layout"));
         }
-        let filter_bytes = read_block(&mut file, filter_offset, filter_size, footer_start)?;
+        let filter_bytes = read_block(file.as_mut(), filter_offset, filter_size, footer_start)?;
         let filter = Bloom::parse(&filter_bytes)?;
-        let index_bytes = read_block(&mut file, index_offset, index_size, footer_start)?;
+        let index_bytes = read_block(file.as_mut(), index_offset, index_size, footer_start)?;
         let mut input = index_bytes.as_slice();
         let count = get_u32(&mut input).ok_or(Error::Corruption("index count"))? as usize;
         if count > input.len() / 26 { return Err(Error::Corruption("index count")); }
@@ -172,7 +174,7 @@ impl SstableReader {
             if block_offset != offset || size < 12 { return Err(Error::Corruption("index layout")); }
             offset = block_offset.checked_add(size).ok_or(Error::Corruption("index overflow"))?;
             if offset > filter_offset { return Err(Error::Corruption("data block range")); }
-            let raw = read_block(&mut file, block_offset, size, filter_offset)?;
+            let raw = read_block(file.as_mut(), block_offset, size, filter_offset)?;
             let (block, first, actual_last) = parse_block(raw)?;
             if first_user_key.is_none() { first_user_key = Some(first.user_key.clone()); }
             if actual_last != last || previous.as_ref().is_some_and(|key| *key >= first) {
@@ -205,7 +207,7 @@ impl SstableReader {
         let key = (self.id, entry.offset);
         if let Some(block) = self.cache.get(key)? { return Ok(block); }
         let mut file = self.file.lock().map_err(|_| Error::Poisoned)?;
-        let raw = read_block(&mut file, entry.offset, entry.size, entry.offset.checked_add(entry.size).ok_or(Error::Corruption("block range"))?)?;
+        let raw = read_block(file.as_mut(), entry.offset, entry.size, entry.offset.checked_add(entry.size).ok_or(Error::Corruption("block range"))?)?;
         let (block, _, last) = parse_block(raw)?;
         if last != entry.last { return Err(Error::Corruption("index key mismatch")); }
         let block = Arc::new(block);
@@ -356,14 +358,14 @@ fn take<'a>(input: &mut &'a [u8], size: usize) -> Result<&'a [u8], Error> {
     Ok(result)
 }
 
-fn read_exact(file: &mut File, bytes: &mut [u8]) -> Result<(), Error> {
+fn read_exact(file: &mut dyn FsFile, bytes: &mut [u8]) -> Result<(), Error> {
     file.read_exact(bytes).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof { Error::Corruption("truncated file") }
         else { Error::Io(error) }
     })
 }
 
-fn read_block(file: &mut File, offset: u64, size: u64, limit: u64) -> Result<Vec<u8>, Error> {
+fn read_block(file: &mut dyn FsFile, offset: u64, size: u64, limit: u64) -> Result<Vec<u8>, Error> {
     if size < 4 || offset.checked_add(size).is_none_or(|end| end > limit) {
         return Err(Error::Corruption("block bounds"));
     }

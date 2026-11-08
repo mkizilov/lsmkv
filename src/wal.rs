@@ -1,11 +1,12 @@
 //! Framed, checksummed write-ahead log batches.
 
-use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use crate::fs::{FileOptions, Fs, FsFile, NativeFs};
 
 pub(crate) const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const BATCH_TYPE: u8 = 1;
@@ -38,12 +39,16 @@ impl WalWriter {
     /// Opens an empty or fully valid WAL for appending; damaged tails must be
     /// truncated to the reader's valid byte count before reopening.
     pub fn open(path: impl AsRef<Path>, policy: SyncPolicy) -> io::Result<Self> {
+        Self::open_with_fs(path, policy, Arc::new(NativeFs))
+    }
+
+    pub fn open_with_fs(path: impl AsRef<Path>, policy: SyncPolicy, fs: Arc<dyn Fs>) -> io::Result<Self> {
         if matches!(policy, SyncPolicy::Interval(interval) if interval.is_zero() || Instant::now().checked_add(interval).is_none()) {
             return Err(invalid_input("invalid sync interval"));
         }
         let path = path.as_ref();
-        let mut file = OpenOptions::new().read(true).append(true).create(true).open(path)?;
-        let length = file.metadata()?.len();
+        let mut file = fs.open(path, FileOptions::new().read(true).append(true).create(true))?;
+        let length = file.len()?;
         let mut reader = WalReader::new(&mut file);
         while reader.next_batch()?.is_some() {}
         if reader.valid_bytes() != length {
@@ -105,7 +110,7 @@ fn invalid_input(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn run_writer(mut file: File, policy: SyncPolicy, receiver: Receiver<Command>) {
+fn run_writer(mut file: Box<dyn FsFile>, policy: SyncPolicy, receiver: Receiver<Command>) {
     let mut dirty = false;
     let mut deadline: Option<Instant> = None;
     let mut failure: Option<(io::ErrorKind, String)> = None;

@@ -1,10 +1,10 @@
 //! Durable append-only version edits and the CURRENT pointer.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
 use crate::encoding::{get_u32, get_u64, put_u32, put_u64};
+use crate::fs::{FileOptions, Fs};
 use crate::wal::crc32c;
 use crate::Error;
 
@@ -25,29 +25,29 @@ pub struct Edit {
     pub last_sequence: u64,
 }
 
-pub fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+pub fn sync_dir(path: &Path, fs: &dyn Fs) -> io::Result<()> {
+    fs.sync_dir(path)
 }
 
-pub fn open(dir: &Path) -> Result<Version, Error> {
+pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
     let current = dir.join("CURRENT");
-    let current_exists = current.exists();
+    let current_exists = fs.exists(&current)?;
     if current_exists {
-        if fs::read(&current)? != CURRENT.as_bytes() { return Err(Error::Corruption("CURRENT")); }
+        if fs.read(&current)? != CURRENT.as_bytes() { return Err(Error::Corruption("CURRENT")); }
     } else {
         let manifest = dir.join(NAME);
-        if !manifest.exists() || fs::metadata(&manifest)?.len() == 0 {
+        if !fs.exists(&manifest)? || fs.len(&manifest)? == 0 {
             let temporary = dir.join("MANIFEST-000001.tmp");
-            let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
+            let mut file = fs.open(&temporary, FileOptions::new().write(true).create(true).truncate(true))?;
             let initial = Edit { added: Vec::new(), removed: Vec::new(), next_file: 1, last_sequence: 0 };
             file.write_all(&encode(&initial)?)?;
             file.sync_all()?;
-            fs::rename(&temporary, &manifest)?;
-            sync_dir(dir)?;
+            fs.rename(&temporary, &manifest)?;
+            sync_dir(dir, fs)?;
         }
     }
     let path = dir.join(NAME);
-    let bytes = fs::read(&path)?;
+    let bytes = fs.read(&path)?;
     let mut position = 0usize;
     let mut version = Version::default();
     while position < bytes.len() {
@@ -69,17 +69,17 @@ pub fn open(dir: &Path) -> Result<Version, Error> {
     }
     if version.next_file == 0 { return Err(Error::Corruption("empty manifest")); }
     if position != bytes.len() {
-        let file = OpenOptions::new().write(true).open(path)?;
+        let file = fs.open(&path, FileOptions::new().write(true))?;
         file.set_len(position as u64)?;
         file.sync_all()?;
     }
     if !current_exists {
         let temporary = dir.join("CURRENT.tmp");
-        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&temporary)?;
+        let mut file = fs.open(&temporary, FileOptions::new().write(true).create(true).truncate(true))?;
         file.write_all(CURRENT.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temporary, &current)?;
-        sync_dir(dir)?;
+        fs.rename(&temporary, &current)?;
+        sync_dir(dir, fs)?;
     }
     Ok(version)
 }
@@ -144,9 +144,9 @@ fn encode(edit: &Edit) -> io::Result<Vec<u8>> {
     Ok(record)
 }
 
-pub fn append(dir: &Path, edit: &Edit) -> io::Result<()> {
+pub fn append(dir: &Path, edit: &Edit, fs: &dyn Fs) -> io::Result<()> {
     let record = encode(edit)?;
-    let mut file = OpenOptions::new().append(true).open(dir.join(NAME))?;
+    let mut file = fs.open(&dir.join(NAME), FileOptions::new().append(true))?;
     file.write_all(&record)?;
     file.sync_all()
 }
@@ -154,6 +154,7 @@ pub fn append(dir: &Path, edit: &Edit) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{append, open, Edit, NAME};
+    use crate::fs::NativeFs;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
@@ -178,14 +179,14 @@ mod tests {
     #[test]
     fn edits_and_torn_tail_recover() {
         let dir = TestDir::new();
-        let version = open(&dir.0).unwrap();
+        let version = open(&dir.0, &NativeFs).unwrap();
         assert_eq!(version.next_file, 1);
-        append(&dir.0, &Edit { added: vec![(0, 2)], removed: Vec::new(), next_file: 3, last_sequence: 7 }).unwrap();
-        append(&dir.0, &Edit { added: vec![(1, 3)], removed: vec![(0, 2)], next_file: 4, last_sequence: 7 }).unwrap();
+        append(&dir.0, &Edit { added: vec![(0, 2)], removed: Vec::new(), next_file: 3, last_sequence: 7 }, &NativeFs).unwrap();
+        append(&dir.0, &Edit { added: vec![(1, 3)], removed: vec![(0, 2)], next_file: 4, last_sequence: 7 }, &NativeFs).unwrap();
         let path = dir.0.join(NAME);
         let valid = fs::metadata(&path).unwrap().len();
         OpenOptions::new().append(true).open(&path).unwrap().write_all(&[1, 2, 3]).unwrap();
-        let version = open(&dir.0).unwrap();
+        let version = open(&dir.0, &NativeFs).unwrap();
         assert_eq!(version.files, vec![(1, 3)]);
         assert_eq!(version.next_file, 4);
         assert_eq!(version.last_sequence, 7);
@@ -193,7 +194,7 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[9] ^= 1;
         fs::write(path, bytes).unwrap();
-        assert!(open(&dir.0).is_err());
+        assert!(open(&dir.0, &NativeFs).is_err());
     }
 
     #[test]
@@ -201,7 +202,7 @@ mod tests {
         let dir = TestDir::new();
         let path = dir.0.join(NAME);
         fs::write(&path, [1, 2, 3]).unwrap();
-        assert!(open(&dir.0).is_err());
+        assert!(open(&dir.0, &NativeFs).is_err());
         assert!(!dir.0.join("CURRENT").exists());
         assert_eq!(fs::read(&path).unwrap(), [1, 2, 3]);
     }
@@ -211,11 +212,11 @@ mod tests {
         let dir = TestDir::new();
         fs::write(dir.0.join("MANIFEST-000001.tmp"), b"partial").unwrap();
         fs::write(dir.0.join("CURRENT.tmp"), b"partial").unwrap();
-        assert_eq!(open(&dir.0).unwrap().next_file, 1);
+        assert_eq!(open(&dir.0, &NativeFs).unwrap().next_file, 1);
         assert!(!dir.0.join("MANIFEST-000001.tmp").exists());
         assert!(!dir.0.join("CURRENT.tmp").exists());
         fs::remove_file(dir.0.join("CURRENT")).unwrap();
-        assert_eq!(open(&dir.0).unwrap().next_file, 1);
+        assert_eq!(open(&dir.0, &NativeFs).unwrap().next_file, 1);
         assert_eq!(fs::read(dir.0.join("CURRENT")).unwrap(), b"MANIFEST-000001\n");
     }
 }
