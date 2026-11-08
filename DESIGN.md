@@ -67,6 +67,38 @@ flush and compaction changes must be made durable before obsolete files are
 removed. File publication and recovery must avoid treating incomplete output as
 live.
 
+### SSTable writer format, version 1
+
+The standalone writer emits data blocks, an empty filter block, an index block,
+and a 40-byte footer, in that order. The writer accepts strictly increasing
+internal keys and requires empty values for deletes. Empty tables are valid.
+All fixed-width integers are little-endian. Varints are canonical unsigned LEB128
+(seven data bits per byte, high bit indicates continuation). Each block is its
+payload followed by a four-byte CRC32C of the payload. All stored block sizes
+include the CRC. The footer is not a block and has no CRC.
+
+An encoded internal key is `user_key || sequence:u64 || kind:u8`, with kind 1
+for Put and 2 for Delete. The user key is all bytes before the final nine bytes.
+These encoded bytes are for storage and prefix compression, not lexicographic
+comparison: keys must be compared using the internal-key ordering above.
+
+Each data block's payload contains entries followed by a restart array and a
+restart count. Each entry is `shared:varint, suffix_len:varint, value_len:varint,
+key_suffix, value`. Its key is the first `shared` bytes of the previous encoded
+key followed by `key_suffix`. The first entry and every sixteenth subsequent
+entry are restart entries with `shared = 0`. The restart array contains the
+u32 byte offset of each restart entry from the beginning of the block payload,
+followed by the u32 number of restarts. A block targets 4096 bytes including
+restart metadata and CRC; a single oversized entry occupies its own block.
+
+The filter block has an empty payload for now (and therefore just its CRC). The
+index payload begins with a u32 block count followed by one entry per data
+block: `key_len:varint, last_encoded_key, offset:u64, size:u64`. Offsets are
+absolute from the start of the SSTable and the index follows data-block order.
+The footer has five u64 fields: filter offset, filter size, index offset, index
+size, and magic `0x31564b4d534c5353`. SSTables are not yet integrated into `Db`;
+the caller must flush/sync, atomically publish, and manage incomplete output.
+
 ## Paths
 
 Writes assign a sequence number, append a Put or Delete to the WAL, honor the

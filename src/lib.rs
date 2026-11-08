@@ -11,6 +11,8 @@ use memtable::{BTreeMemtable, InternalKey, Kind, Memtable};
 use wal::{Operation, SyncPolicy, WalReader, WalWriter};
 
 pub mod memtable;
+pub mod encoding;
+pub mod sstable;
 pub mod wal;
 
 #[derive(Debug, thiserror::Error)]

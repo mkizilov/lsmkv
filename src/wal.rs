@@ -220,7 +220,7 @@ fn encode(batch: &[Operation]) -> io::Result<Vec<u8>> {
     Ok(framed)
 }
 
-fn crc32c(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in bytes {
         crc ^= u32::from(byte);
