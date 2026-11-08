@@ -3,6 +3,9 @@ name = "lsmkv"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+fuzzing = []
+
 [dependencies]
 fs2 = "0.4"
 thiserror = "2"

@@ -146,16 +146,7 @@ impl SstableReader {
         file.seek(SeekFrom::Start(footer_start))?;
         let mut footer = [0; 40];
         read_exact(file.as_mut(), &mut footer)?;
-        let mut f = &footer[..];
-        let filter_offset = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
-        let filter_size = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
-        let index_offset = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
-        let index_size = get_u64(&mut f).ok_or(Error::Corruption("footer"))?;
-        if get_u64(&mut f) != Some(FOOTER_MAGIC) || filter_size < 4
-            || filter_offset.checked_add(filter_size) != Some(index_offset)
-            || index_offset.checked_add(index_size) != Some(footer_start) {
-            return Err(Error::Corruption("footer layout"));
-        }
+        let Footer { filter_offset, filter_size, index_offset, index_size } = decode_footer(&footer, file_len)?;
         let filter_bytes = read_block(file.as_mut(), filter_offset, filter_size, footer_start)?;
         let filter = Bloom::parse(&filter_bytes)?;
         let index_bytes = read_block(file.as_mut(), index_offset, index_size, footer_start)?;
@@ -266,6 +257,41 @@ impl SstableReader {
         SstableIterator { table: self, number: 0, block: None, offset: 0, previous: Vec::new(), failed: false }
     }
 }
+
+struct Footer {
+    filter_offset: u64,
+    filter_size: u64,
+    index_offset: u64,
+    index_size: u64,
+}
+
+fn decode_footer(bytes: &[u8], file_len: u64) -> Result<Footer, Error> {
+    if bytes.len() != 40 || file_len < 48 { return Err(Error::Corruption("short footer")); }
+    let mut input = bytes;
+    let filter_offset = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
+    let filter_size = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
+    let index_offset = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
+    let index_size = get_u64(&mut input).ok_or(Error::Corruption("footer"))?;
+    if get_u64(&mut input) != Some(FOOTER_MAGIC) || filter_size < 4
+        || filter_offset.checked_add(filter_size) != Some(index_offset)
+        || index_offset.checked_add(index_size) != Some(file_len - 40) {
+        return Err(Error::Corruption("footer layout"));
+    }
+    Ok(Footer { filter_offset, filter_size, index_offset, index_size })
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_footer(bytes: &[u8]) -> Result<(), Error> {
+    let mut input = bytes;
+    let file_len = get_u64(&mut input).ok_or(Error::Corruption("footer length"))?;
+    decode_footer(input, file_len).map(|_| ())
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_block(bytes: &[u8]) -> Result<(), Error> { parse_block(bytes.to_vec()).map(|_| ()) }
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_filter(bytes: &[u8]) -> Result<(), Error> { Bloom::parse(bytes).map(|_| ()) }
 
 /// Forward iterator over internal keys in ascending internal-key order.
 pub struct SstableIterator<'a> {
@@ -425,7 +451,8 @@ fn parse_block(data: Vec<u8>) -> Result<(Block, InternalKey, InternalKey), Error
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, BlockCache};
+    use super::{decode_footer, parse_block, Block, BlockCache, FOOTER_MAGIC};
+    use crate::encoding::put_u64;
     use crate::Options;
     use std::sync::Arc;
 
@@ -451,5 +478,22 @@ mod tests {
             cache.insert((1, 0), Arc::clone(&block)).unwrap();
             assert!(cache.get((1, 0)).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn malformed_footer_and_restart_counts_are_rejected() {
+        for length in 0..40 {
+            assert!(decode_footer(&vec![0; length], 48).is_err());
+        }
+        let mut footer = Vec::new();
+        for value in [0, 4, 4, 8, FOOTER_MAGIC] { put_u64(&mut footer, value); }
+        assert!(decode_footer(&footer, 52).is_ok());
+        for index in 0..footer.len() {
+            let mut damaged = footer.clone();
+            damaged[index] ^= 1;
+            assert!(decode_footer(&damaged, 52).is_err());
+        }
+        assert!(parse_block(u32::MAX.to_le_bytes().to_vec()).is_err());
+        assert!(parse_block(vec![0x80, 0x80, 0x80, 0xff, 0xff, 0xff, 0xff]).is_err());
     }
 }

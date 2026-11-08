@@ -21,6 +21,8 @@ pub mod encoding;
 pub mod sstable;
 pub mod wal;
 pub mod fs;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 mod manifest;
 mod flush;
 mod merge;

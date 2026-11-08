@@ -226,14 +226,17 @@ fn encode(batch: &[Operation]) -> io::Result<Vec<u8>> {
 }
 
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
+    !crc32c_extend(!0u32, bytes)
+}
+
+fn crc32c_extend(mut crc: u32, bytes: &[u8]) -> u32 {
     for &byte in bytes {
         crc ^= u32::from(byte);
         for _ in 0..8 {
             crc = (crc >> 1) ^ (0x82f63b78 & (0u32.wrapping_sub(crc & 1)));
         }
     }
-    !crc
+    crc
 }
 
 fn take<'a>(input: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
@@ -247,7 +250,7 @@ fn decode(mut payload: &[u8]) -> Option<Vec<Operation>> {
     if count == 0 || count > payload.len() / 17 {
         return None;
     }
-    let mut operations = Vec::with_capacity(count);
+    let mut operations = Vec::new();
     for _ in 0..count {
         let kind = *take(&mut payload, 1)?.first()?;
         let sequence = u64::from_le_bytes(take(&mut payload, 8)?.try_into().ok()?);
@@ -262,6 +265,11 @@ fn decode(mut payload: &[u8]) -> Option<Vec<Operation>> {
         });
     }
     if payload.is_empty() { Some(operations) } else { None }
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_payload(bytes: &[u8]) -> Result<(), crate::Error> {
+    decode(bytes).map(|_| ()).ok_or(crate::Error::Corruption("invalid WAL payload"))
 }
 
 /// Sequential reader that stops at the first invalid or incomplete record.
@@ -294,15 +302,12 @@ impl<R: Read> WalReader<R> {
             self.stopped = true;
             return Ok(None);
         }
-        let mut payload = vec![0; length];
-        if !read_complete(&mut self.input, &mut payload)? {
+        let Some(payload) = read_payload(&mut self.input, length)? else {
             self.stopped = true;
             return Ok(None);
-        }
-        let mut checked = Vec::with_capacity(length + 5);
-        checked.extend_from_slice(&header[4..]);
-        checked.extend_from_slice(&payload);
-        let batch = if crc32c(&checked) == checksum { decode(&payload) } else { None };
+        };
+        let checksum_actual = !crc32c_extend(crc32c_extend(!0u32, &header[4..]), &payload);
+        let batch = if checksum_actual == checksum { decode(&payload) } else { None };
         if batch.is_none() {
             self.stopped = true;
             return Ok(None);
@@ -311,6 +316,24 @@ impl<R: Read> WalReader<R> {
         self.stopped = false;
         Ok(batch)
     }
+}
+
+fn read_payload(reader: &mut impl Read, length: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut payload = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while payload.len() < length {
+        let requested = (length - payload.len()).min(buffer.len());
+        let count = match reader.read(&mut buffer[..requested]) {
+            Ok(0) => return Ok(None),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        payload.try_reserve(count).map_err(|_| io::Error::other("WAL payload allocation failed"))?;
+        payload.extend_from_slice(&buffer[..count]);
+    }
+    Ok(Some(payload))
 }
 
 fn read_complete(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
@@ -323,9 +346,9 @@ fn read_complete(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> 
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, Operation, SyncPolicy, WalReader, WalWriter};
+    use super::{crc32c, crc32c_extend, decode, Operation, SyncPolicy, WalReader, WalWriter};
     use std::fs::{self, File};
-    use std::io::{Cursor, Write};
+    use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -355,10 +378,34 @@ mod tests {
     #[test]
     fn crc_known_vector_and_empty_file() {
         assert_eq!(crc32c(b"123456789"), 0xe3069283);
+        assert_eq!(!crc32c_extend(crc32c_extend(!0, b"1234"), b"56789"), 0xe3069283);
         let mut reader = WalReader::new(Cursor::new(Vec::<u8>::new()));
         assert_eq!(reader.next_batch().unwrap(), None);
         assert_eq!(reader.valid_bytes(), 0);
         assert_eq!(reader.next_batch().unwrap(), None);
+    }
+
+    #[test]
+    fn torn_large_payload_is_read_in_bounded_chunks() {
+        struct Limited(Cursor<Vec<u8>>);
+        impl Read for Limited {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if bytes.len() > 8192 { return Err(io::Error::other("unbounded read request")); }
+                self.0.read(bytes)
+            }
+        }
+        let mut header = vec![0; 4];
+        header.extend_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+        header.push(1);
+        let mut reader = WalReader::new(Limited(Cursor::new(header)));
+        assert_eq!(reader.next_batch().unwrap(), None);
+        assert_eq!(reader.valid_bytes(), 0);
+    }
+
+    #[test]
+    fn impossible_wal_operation_count_is_rejected() {
+        let bytes = u32::MAX.to_le_bytes();
+        assert_eq!(decode(&bytes), None);
     }
 
     #[test]

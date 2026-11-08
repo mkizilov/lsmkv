@@ -6,3 +6,7 @@ _opam/
 .DS_Store
 /target/
 /.cortexkit/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/

@@ -9,6 +9,8 @@ use crate::wal::crc32c;
 mod reader;
 mod bloom;
 pub use reader::{BlockCache, SstableIterator, SstableReader};
+#[cfg(feature = "fuzzing")]
+pub(crate) use reader::{fuzz_block, fuzz_filter, fuzz_footer};
 
 const TARGET_BLOCK_SIZE: usize = 4096;
 const RESTART_INTERVAL: usize = 16;

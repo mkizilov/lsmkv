@@ -48,6 +48,24 @@ pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
     }
     let path = dir.join(NAME);
     let bytes = fs.read(&path)?;
+    let (version, position) = parse_records(&bytes)?;
+    if position != bytes.len() {
+        let file = fs.open(&path, FileOptions::new().write(true))?;
+        file.set_len(position as u64)?;
+        file.sync_all()?;
+    }
+    if !current_exists {
+        let temporary = dir.join("CURRENT.tmp");
+        let mut file = fs.open(&temporary, FileOptions::new().write(true).create(true).truncate(true))?;
+        file.write_all(CURRENT.as_bytes())?;
+        file.sync_all()?;
+        fs.rename(&temporary, &current)?;
+        sync_dir(dir, fs)?;
+    }
+    Ok(version)
+}
+
+fn parse_records(bytes: &[u8]) -> Result<(Version, usize), Error> {
     let mut position = 0usize;
     let mut version = Version::default();
     while position < bytes.len() {
@@ -68,21 +86,14 @@ pub fn open(dir: &Path, fs: &dyn Fs) -> Result<Version, Error> {
         position = end;
     }
     if version.next_file == 0 { return Err(Error::Corruption("empty manifest")); }
-    if position != bytes.len() {
-        let file = fs.open(&path, FileOptions::new().write(true))?;
-        file.set_len(position as u64)?;
-        file.sync_all()?;
-    }
-    if !current_exists {
-        let temporary = dir.join("CURRENT.tmp");
-        let mut file = fs.open(&temporary, FileOptions::new().write(true).create(true).truncate(true))?;
-        file.write_all(CURRENT.as_bytes())?;
-        file.sync_all()?;
-        fs.rename(&temporary, &current)?;
-        sync_dir(dir, fs)?;
-    }
-    Ok(version)
+    Ok((version, position))
 }
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_edit(bytes: &[u8]) -> Result<(), Error> { decode(bytes).map(|_| ()) }
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_log(bytes: &[u8]) -> Result<(), Error> { parse_records(bytes).map(|_| ()) }
 
 fn decode(mut bytes: &[u8]) -> Result<Edit, Error> {
     let version = get_u32(&mut bytes).ok_or(Error::Corruption("manifest edit"))?;
@@ -153,7 +164,7 @@ pub fn append(dir: &Path, edit: &Edit, fs: &dyn Fs) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append, open, Edit, NAME};
+    use super::{append, decode, open, parse_records, Edit, NAME};
     use crate::fs::NativeFs;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
@@ -218,5 +229,19 @@ mod tests {
         fs::remove_file(dir.0.join("CURRENT")).unwrap();
         assert_eq!(open(&dir.0, &NativeFs).unwrap().next_file, 1);
         assert_eq!(fs::read(dir.0.join("CURRENT")).unwrap(), b"MANIFEST-000001\n");
+    }
+
+    #[test]
+    fn impossible_manifest_counts_and_torn_headers_are_rejected() {
+        let mut edit = Vec::new();
+        edit.extend_from_slice(&1u32.to_le_bytes());
+        edit.extend_from_slice(&1u64.to_le_bytes());
+        edit.extend_from_slice(&0u64.to_le_bytes());
+        edit.extend_from_slice(&u32::MAX.to_le_bytes());
+        edit.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&edit).is_err());
+        for length in 0..12 {
+            assert!(parse_records(&vec![0; length]).is_err());
+        }
     }
 }

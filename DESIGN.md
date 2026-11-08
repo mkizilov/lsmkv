@@ -170,6 +170,8 @@ The reader returns complete validated batches in order, stopping permanently at
 the first incomplete, invalid, or corrupt record; `valid_bytes` identifies the
 safe prefix to retain. I/O errors are returned separately. A writer refuses to
 append to a damaged tail: recovery must truncate it to the valid prefix first.
+The reader consumes payloads in bounded chunks rather than allocating a declared
+length before the bytes arrive; complete payloads remain limited to 64 MiB.
 The writer syncs each append or uses a worker to sync within the configured
 interval after the first unsynced append, even during inactivity. Interval-mode
 acknowledgement is not a durability guarantee; explicit `sync` or `close` waits

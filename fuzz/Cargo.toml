@@ -1,0 +1,36 @@
+[package]
+name = "lsmkv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.9"
+lsmkv = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "wal"
+path = "fuzz_targets/wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sstable"
+path = "fuzz_targets/sstable.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
