@@ -123,4 +123,4 @@ all Rust installations, caches and temporary files remained project-local.
 
 ## License
 
-MIT; see `LICENSE`. Third-party dependencies retain their own licenses.
+MIT; see [LICENSE](LICENSE).
